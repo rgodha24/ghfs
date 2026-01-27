@@ -20,6 +20,8 @@ pub struct InodeInfo {
     pub path: PathBuf,
     /// The underlying file's device and inode.
     pub key: UnderlyingKey,
+    /// Parent inode for directory traversal ("..").
+    pub parent: u64,
 }
 
 /// Manages mapping between FUSE inodes and underlying filesystem paths.
@@ -54,22 +56,16 @@ impl InodeTable {
 
     /// Get or create an inode for an underlying file.
     /// Returns (fuse_inode, is_new).
-    pub fn get_or_insert(&self, path: PathBuf, key: UnderlyingKey) -> (u64, bool) {
-        // Check if we already have this underlying file
-        if let Some(ino) = self.reverse.get(&key) {
-            return (*ino, false);
+    pub fn get_or_insert(&self, path: PathBuf, key: UnderlyingKey, parent: u64) -> (u64, bool) {
+        match self.reverse.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => (*entry.get(), false),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+                entry.insert(ino);
+                self.inodes.insert(ino, InodeInfo { path, key, parent });
+                (ino, true)
+            }
         }
-
-        // Allocate new inode
-        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-
-        // Insert into both maps
-        // Note: race possible - another thread might have inserted
-        // DashMap handles this atomically
-        self.reverse.entry(key).or_insert(ino);
-        self.inodes.insert(ino, InodeInfo { path, key });
-
-        (ino, true)
     }
 
     /// Look up info for a FUSE inode.
@@ -123,7 +119,7 @@ mod tests {
             ino: 100,
             generation: GenerationId::new(1),
         };
-        let (ino, is_new) = table.get_or_insert("/test/path".into(), key);
+        let (ino, is_new) = table.get_or_insert("/test/path".into(), key, ROOT_INO);
 
         assert!(is_new);
         assert!(ino >= PASSTHROUGH_INO_START);
@@ -138,8 +134,8 @@ mod tests {
             generation: GenerationId::new(1),
         };
 
-        let (ino1, _) = table.get_or_insert("/test/path".into(), key);
-        let (ino2, is_new) = table.get_or_insert("/test/path".into(), key);
+        let (ino1, _) = table.get_or_insert("/test/path".into(), key, ROOT_INO);
+        let (ino2, is_new) = table.get_or_insert("/test/path".into(), key, ROOT_INO);
 
         assert!(!is_new);
         assert_eq!(ino1, ino2);
@@ -159,8 +155,8 @@ mod tests {
             generation: GenerationId::new(2),
         };
 
-        let (ino1, _) = table.get_or_insert("/gen1/path".into(), key1);
-        let (ino2, _) = table.get_or_insert("/gen2/path".into(), key2);
+        let (ino1, _) = table.get_or_insert("/gen1/path".into(), key1, ROOT_INO);
+        let (ino2, _) = table.get_or_insert("/gen2/path".into(), key2, ROOT_INO);
 
         assert_ne!(ino1, ino2);
     }
@@ -182,7 +178,7 @@ mod tests {
             generation: GenerationId::new(1),
         };
         let path: PathBuf = "/test/path".into();
-        let (ino, _) = table.get_or_insert(path.clone(), key);
+        let (ino, _) = table.get_or_insert(path.clone(), key, ROOT_INO);
 
         let info = table.get(ino).expect("Should find inode info");
         assert_eq!(info.path, path);
@@ -203,7 +199,7 @@ mod tests {
             ino: 100,
             generation: GenerationId::new(1),
         };
-        let (ino, _) = table.get_or_insert("/test/path".into(), key);
+        let (ino, _) = table.get_or_insert("/test/path".into(), key, ROOT_INO);
 
         // Verify it exists
         assert!(table.get(ino).is_some());
@@ -215,7 +211,7 @@ mod tests {
         assert!(table.get(ino).is_none());
 
         // Inserting again should give a new inode
-        let (new_ino, is_new) = table.get_or_insert("/test/path".into(), key);
+        let (new_ino, is_new) = table.get_or_insert("/test/path".into(), key, ROOT_INO);
         assert!(is_new);
         assert_ne!(ino, new_ino);
     }
@@ -236,8 +232,8 @@ mod tests {
             generation: GenerationId::new(1),
         };
 
-        let (ino1, _) = table.get_or_insert("/path1".into(), key1);
-        let (ino2, _) = table.get_or_insert("/path2".into(), key2);
+        let (ino1, _) = table.get_or_insert("/path1".into(), key1, ROOT_INO);
+        let (ino2, _) = table.get_or_insert("/path2".into(), key2, ROOT_INO);
 
         // Both should exist
         assert!(table.get(ino1).is_some());

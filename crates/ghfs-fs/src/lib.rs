@@ -1,11 +1,13 @@
 //! GHFS FUSE filesystem implementation.
 
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request,
 };
 use ghfs_cache::{CachePaths, RepoCache};
-use ghfs_types::GenerationId;
+use ghfs_types::{GenerationId, RepoKey};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -24,10 +26,20 @@ pub use inode::{
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// Owner inode (octocat)
-const OWNER_INO: u64 = 2;
-/// Repo inode (Hello-World)
-const REPO_INO: u64 = 3;
+/// Virtual node types for dynamic owner/repo hierarchy
+#[derive(Debug, Clone)]
+enum VirtualNode {
+    /// Root directory (inode 1)
+    Root,
+    /// Owner directory (e.g., "octocat")
+    Owner(String),
+    /// Repository directory
+    Repo {
+        owner: String,
+        repo: String,
+        parent: u64,
+    },
+}
 
 /// Create an UnderlyingKey from filesystem metadata and generation ID.
 fn underlying_key_from_metadata(
@@ -44,12 +56,9 @@ fn underlying_key_from_metadata(
 
 /// The GHFS filesystem.
 pub struct GhFs {
-    #[allow(dead_code)] // Will be used when materializing repos
     cache: Arc<RepoCache>,
     /// Inode table for managing passthrough inodes
     inodes: InodeTable,
-    /// For MVP: current generation (root_path, generation_id)
-    current_generation: Mutex<Option<(PathBuf, GenerationId)>>,
     /// Cached UID for file attributes
     uid: u32,
     /// Cached GID for file attributes
@@ -58,20 +67,36 @@ pub struct GhFs {
     open_files: Mutex<HashMap<u64, File>>,
     /// Next file handle to assign
     next_fh: AtomicU64,
+    /// Virtual nodes indexed by inode
+    virtual_nodes: DashMap<u64, VirtualNode>,
+    /// Map from (parent_ino, name) to child inode for virtual nodes
+    virtual_names: DashMap<(u64, String), u64>,
+    /// Next virtual inode to allocate (starts at 2, since 1 is root)
+    next_virtual_ino: AtomicU64,
+    /// Cache of materialized repo paths: (owner, repo) -> (path, generation_id)
+    repo_generations: DashMap<(String, String), (PathBuf, GenerationId)>,
 }
 
 impl GhFs {
     pub fn new(cache: Arc<RepoCache>) -> Self {
         // Cache uid/gid at startup to avoid repeated unsafe calls
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+
+        let virtual_nodes = DashMap::new();
+        // Insert root node
+        virtual_nodes.insert(ROOT_INO, VirtualNode::Root);
+
         Self {
             cache,
             inodes: InodeTable::new(),
-            current_generation: Mutex::new(None),
             uid,
             gid,
             open_files: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            virtual_nodes,
+            virtual_names: DashMap::new(),
+            next_virtual_ino: AtomicU64::new(VIRTUAL_INO_START), // Start at 2
+            repo_generations: DashMap::new(),
         }
     }
 
@@ -81,31 +106,136 @@ impl GhFs {
         Self::new(cache)
     }
 
-    /// Ensure the hardcoded repo is materialized and return its generation path and ID.
-    fn ensure_repo(&self) -> Option<(PathBuf, GenerationId)> {
-        let mut cached = match self.current_generation.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // Recover from poisoned mutex - another thread panicked while holding the lock
-                log::warn!("Recovering from poisoned mutex in ensure_repo");
-                poisoned.into_inner()
+    /// Allocate a new virtual inode
+    fn alloc_virtual_ino(&self) -> Result<u64, i32> {
+        self.next_virtual_ino
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current >= PASSTHROUGH_INO_START {
+                    None
+                } else {
+                    Some(current + 1)
+                }
+            })
+            .map_err(|_| libc::ENOSPC)
+    }
+
+    /// Get or create an owner virtual node
+    fn get_or_create_owner(&self, owner: &str) -> Result<u64, i32> {
+        let key = (ROOT_INO, owner.to_string());
+        match self.virtual_names.entry(key) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
+                let ino = self.alloc_virtual_ino()?;
+                self.virtual_nodes
+                    .insert(ino, VirtualNode::Owner(owner.to_string()));
+                entry.insert(ino);
+                Ok(ino)
             }
+        }
+    }
+
+    /// Get or create a repo virtual node under an owner
+    fn get_or_create_repo(&self, parent_ino: u64, owner: &str, repo: &str) -> Result<u64, i32> {
+        let key = (parent_ino, repo.to_string());
+        match self.virtual_names.entry(key) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
+                let ino = self.alloc_virtual_ino()?;
+                self.virtual_nodes.insert(
+                    ino,
+                    VirtualNode::Repo {
+                        owner: owner.to_string(),
+                        repo: repo.to_string(),
+                        parent: parent_ino,
+                    },
+                );
+                entry.insert(ino);
+                Ok(ino)
+            }
+        }
+    }
+
+    /// Ensure a repo is materialized and return its generation path and ID.
+    /// Called when traversing INTO a repo (lookup child or readdir).
+    fn ensure_repo_materialized(&self, owner: &str, repo: &str) -> Option<(PathBuf, GenerationId)> {
+        let cache_key = (owner.to_string(), repo.to_string());
+
+        // Fast path: check if already cached
+        if let Some(entry) = self.repo_generations.get(&cache_key) {
+            return Some(entry.clone());
+        }
+
+        // Slow path: materialize the repo
+        let key_str = format!("{}/{}", owner, repo);
+        let key: RepoKey = match key_str.parse() {
+            Ok(k) => k,
+            Err(_) => return None,
         };
-        if cached.is_none() {
-            // Hardcoded for MVP
-            let key: ghfs_types::RepoKey = match "octocat/Hello-World".parse() {
-                Ok(k) => k,
-                Err(_) => return None,
-            };
-            match self.cache.ensure_current(&key) {
-                Ok(g) => *cached = Some((g.path, g.generation)),
-                Err(e) => {
-                    log::error!("Failed to materialize repo: {}", e);
-                    return None;
+        match self.cache.ensure_current(&key) {
+            Ok(g) => {
+                let result = (g.path.clone(), g.generation);
+                self.repo_generations.insert(cache_key, result.clone());
+                Some(result)
+            }
+            Err(e) => {
+                log::error!("Failed to materialize repo {}/{}: {}", owner, repo, e);
+                None
+            }
+        }
+    }
+
+    /// List cached owners by scanning the worktrees directory
+    fn list_cached_owners(&self) -> Vec<String> {
+        let worktrees_dir = self.cache_paths().worktrees_dir();
+        let mut owners = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    if let Some(name) = entry.file_name().to_str() {
+                        owners.push(name.to_string());
+                    }
                 }
             }
         }
-        cached.clone()
+
+        owners
+    }
+
+    /// List cached repos for an owner by scanning their worktrees directory
+    fn list_cached_repos(&self, owner: &str) -> Vec<String> {
+        let owner_dir = self.cache_paths().worktrees_dir().join(owner);
+        let mut repos = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&owner_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    if let Some(name) = entry.file_name().to_str() {
+                        repos.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        repos
+    }
+
+    /// Get cache paths for directory scanning
+    fn cache_paths(&self) -> CachePaths {
+        // We need to get the paths from the cache
+        // Since RepoCache doesn't expose paths, we'll use default for now
+        // In a real implementation, we'd want RepoCache to expose its paths
+        CachePaths::default()
+    }
+
+    /// Check if a name is a valid GitHub owner/repo name
+    fn is_valid_github_name(name: &str) -> bool {
+        !name.is_empty()
+            && !name.starts_with('.')
+            && !name.starts_with('-')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     }
 
     /// Mount the filesystem at the given path.
@@ -192,11 +322,12 @@ fn metadata_to_attr(ino: u64, metadata: &std::fs::Metadata) -> FileAttr {
 
 impl Filesystem for GhFs {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        // Virtual inodes
+        // Virtual inodes - check if it exists in our virtual_nodes map
         if InodeTable::is_virtual(ino) {
-            match ino {
-                ROOT_INO | OWNER_INO | REPO_INO => reply.attr(&TTL, &self.dir_attr(ino)),
-                _ => reply.error(libc::ENOENT),
+            if self.virtual_nodes.contains_key(&ino) {
+                reply.attr(&TTL, &self.dir_attr(ino));
+            } else {
+                reply.error(libc::ENOENT);
             }
             return;
         }
@@ -229,77 +360,102 @@ impl Filesystem for GhFs {
             }
         };
 
-        // Root directory lookups
+        // Root directory lookups - dynamically create owner nodes
         if parent == ROOT_INO {
-            match name_str {
-                "octocat" => {
-                    // Hardcoded owner inode for MVP
-                    reply.entry(&TTL, &self.dir_attr(OWNER_INO), 0);
-                }
-                _ => reply.error(libc::ENOENT),
+            if !Self::is_valid_github_name(name_str) {
+                reply.error(libc::ENOENT);
+                return;
             }
-            return;
-        }
 
-        // Owner directory lookups (inode 2 = octocat)
-        if parent == OWNER_INO {
-            match name_str {
-                "Hello-World" => {
-                    // Hardcoded repo inode for MVP
-                    reply.entry(&TTL, &self.dir_attr(REPO_INO), 0);
-                }
-                _ => reply.error(libc::ENOENT),
-            }
-            return;
-        }
-
-        // Handle REPO_INO - this is where passthrough starts
-        if parent == REPO_INO {
-            let (gen_path, gen_id) = match self.ensure_repo() {
-                Some(p) => p,
-                None => {
-                    reply.error(libc::EIO);
+            // Create or get owner node
+            let owner_ino = match self.get_or_create_owner(name_str) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    reply.error(e);
                     return;
                 }
             };
-
-            let child_path = gen_path.join(name);
-            match std::fs::symlink_metadata(&child_path) {
-                Ok(metadata) => {
-                    let key = underlying_key_from_metadata(&metadata, gen_id);
-                    let (ino, _) = self.inodes.get_or_insert(child_path, key);
-                    let attr = metadata_to_attr(ino, &metadata);
-                    reply.entry(&TTL, &attr, 0);
-                }
-                Err(_) => reply.error(libc::ENOENT),
-            }
+            reply.entry(&TTL, &self.dir_attr(owner_ino), 0);
             return;
         }
 
-        // Passthrough lookup for non-virtual inodes
-        if !InodeTable::is_virtual(parent) {
-            let parent_info = match self.inodes.get(parent) {
-                Some(info) => info,
-                None => {
+        // Check if parent is a virtual node
+        let parent_node = match self.virtual_nodes.get(&parent) {
+            Some(node) => node.clone(),
+            None => {
+                // Not a virtual node, check passthrough
+                if !InodeTable::is_virtual(parent) {
+                    // Passthrough lookup
+                    let parent_info = match self.inodes.get(parent) {
+                        Some(info) => info,
+                        None => {
+                            reply.error(libc::ENOENT);
+                            return;
+                        }
+                    };
+
+                    let child_path = parent_info.path.join(name);
+                    match std::fs::symlink_metadata(&child_path) {
+                        Ok(metadata) => {
+                            let key =
+                                underlying_key_from_metadata(&metadata, parent_info.key.generation);
+                            let (ino, _) = self.inodes.get_or_insert(child_path, key, parent);
+                            let attr = metadata_to_attr(ino, &metadata);
+                            reply.entry(&TTL, &attr, 0);
+                        }
+                        Err(_) => reply.error(libc::ENOENT),
+                    }
+                    return;
+                }
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match parent_node {
+            VirtualNode::Owner(owner) => {
+                // Looking up a repo under an owner
+                if !Self::is_valid_github_name(name_str) {
                     reply.error(libc::ENOENT);
                     return;
                 }
-            };
 
-            let child_path = parent_info.path.join(name);
-            match std::fs::symlink_metadata(&child_path) {
-                Ok(metadata) => {
-                    let key = underlying_key_from_metadata(&metadata, parent_info.key.generation);
-                    let (ino, _) = self.inodes.get_or_insert(child_path, key);
-                    let attr = metadata_to_attr(ino, &metadata);
-                    reply.entry(&TTL, &attr, 0);
-                }
-                Err(_) => reply.error(libc::ENOENT),
+                // Create or get repo node
+                let repo_ino = match self.get_or_create_repo(parent, &owner, name_str) {
+                    Ok(ino) => ino,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
+                };
+                reply.entry(&TTL, &self.dir_attr(repo_ino), 0);
             }
-            return;
-        }
+            VirtualNode::Repo { owner, repo, .. } => {
+                // Looking up inside a repo - this triggers materialization
+                let (gen_path, gen_id) = match self.ensure_repo_materialized(&owner, &repo) {
+                    Some(p) => p,
+                    None => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                };
 
-        reply.error(libc::ENOENT);
+                let child_path = gen_path.join(name);
+                match std::fs::symlink_metadata(&child_path) {
+                    Ok(metadata) => {
+                        let key = underlying_key_from_metadata(&metadata, gen_id);
+                        let (ino, _) = self.inodes.get_or_insert(child_path, key, parent);
+                        let attr = metadata_to_attr(ino, &metadata);
+                        reply.entry(&TTL, &attr, 0);
+                    }
+                    Err(_) => reply.error(libc::ENOENT),
+                }
+            }
+            VirtualNode::Root => {
+                // Should have been handled above
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
     fn readdir(
@@ -311,136 +467,17 @@ impl Filesystem for GhFs {
         mut reply: ReplyDirectory,
     ) {
         if ino == ROOT_INO {
-            // Hardcoded entries for MVP
-            // Format: (inode, type, name)
-            let entries: Vec<(u64, FileType, &str)> = vec![
-                (ROOT_INO, FileType::Directory, "."),
-                (ROOT_INO, FileType::Directory, ".."),
-                // Placeholder owner - will be replaced with actual cached owners later
-                (OWNER_INO, FileType::Directory, "octocat"),
-            ];
+            // List cached owners
+            let cached_owners = self.list_cached_owners();
 
-            for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-                // buffer full means reply.add returns true
-                if reply.add(ino, (i + 1) as i64, kind, name) {
-                    break;
-                }
-            }
-            reply.ok();
-            return;
-        }
-
-        // Owner directory (inode 2 = octocat)
-        if ino == OWNER_INO {
-            let entries: Vec<(u64, FileType, &str)> = vec![
-                (OWNER_INO, FileType::Directory, "."),
-                (ROOT_INO, FileType::Directory, ".."),
-                (REPO_INO, FileType::Directory, "Hello-World"),
-            ];
-
-            for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-                if reply.add(ino, (i + 1) as i64, kind, name) {
-                    break;
-                }
-            }
-            reply.ok();
-            return;
-        }
-
-        // Repo directory (inode 3 = Hello-World) - passthrough to underlying repo
-        if ino == REPO_INO {
-            let (gen_path, gen_id) = match self.ensure_repo() {
-                Some(p) => p,
-                None => {
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-
-            // Read the underlying directory
-            let read_dir = match std::fs::read_dir(&gen_path) {
-                Ok(rd) => rd,
-                Err(_) => {
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-
-            // Collect entries: . and .. plus directory contents
             let mut entries: Vec<(u64, FileType, String)> = vec![
-                (REPO_INO, FileType::Directory, ".".to_string()),
-                (OWNER_INO, FileType::Directory, "..".to_string()),
+                (ROOT_INO, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
             ];
 
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let child_path = gen_path.join(&name);
-                if let Ok(metadata) = std::fs::symlink_metadata(&child_path) {
-                    let key = underlying_key_from_metadata(&metadata, gen_id);
-                    let (child_ino, _) = self.inodes.get_or_insert(child_path, key);
-                    let file_type = if metadata.is_dir() {
-                        FileType::Directory
-                    } else if metadata.is_symlink() {
-                        FileType::Symlink
-                    } else {
-                        FileType::RegularFile
-                    };
-                    entries.push((child_ino, file_type, name));
-                }
-            }
-
-            for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-                if reply.add(ino, (i + 1) as i64, kind, &name) {
-                    break;
-                }
-            }
-            reply.ok();
-            return;
-        }
-
-        // Passthrough readdir for non-virtual inodes
-        if !InodeTable::is_virtual(ino) {
-            let info = match self.inodes.get(ino) {
-                Some(info) => info,
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-            };
-
-            // Read the underlying directory
-            let read_dir = match std::fs::read_dir(&info.path) {
-                Ok(rd) => rd,
-                Err(_) => {
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-
-            // Get parent inode - for simplicity, use the current ino for ".."
-            // In a full implementation, we'd track parent relationships
-            let parent_ino = ino; // Simplified: actual parent tracking would be better
-
-            // Collect entries
-            let mut entries: Vec<(u64, FileType, String)> = vec![
-                (ino, FileType::Directory, ".".to_string()),
-                (parent_ino, FileType::Directory, "..".to_string()),
-            ];
-
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let child_path = info.path.join(&name);
-                if let Ok(metadata) = std::fs::symlink_metadata(&child_path) {
-                    let key = underlying_key_from_metadata(&metadata, info.key.generation);
-                    let (child_ino, _) = self.inodes.get_or_insert(child_path, key);
-                    let file_type = if metadata.is_dir() {
-                        FileType::Directory
-                    } else if metadata.is_symlink() {
-                        FileType::Symlink
-                    } else {
-                        FileType::RegularFile
-                    };
-                    entries.push((child_ino, file_type, name));
+            for owner in cached_owners {
+                if let Ok(owner_ino) = self.get_or_create_owner(&owner) {
+                    entries.push((owner_ino, FileType::Directory, owner));
                 }
             }
 
@@ -455,7 +492,150 @@ impl Filesystem for GhFs {
             return;
         }
 
-        reply.error(libc::ENOENT);
+        // Check if it's a virtual node
+        let node = match self.virtual_nodes.get(&ino) {
+            Some(n) => n.clone(),
+            None => {
+                // Not a virtual node, check passthrough
+                if !InodeTable::is_virtual(ino) {
+                    // Passthrough readdir
+                    let info = match self.inodes.get(ino) {
+                        Some(info) => info,
+                        None => {
+                            reply.error(libc::ENOENT);
+                            return;
+                        }
+                    };
+
+                    let read_dir = match std::fs::read_dir(&info.path) {
+                        Ok(rd) => rd,
+                        Err(_) => {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    };
+
+                    let parent_ino = ino;
+                    let mut entries: Vec<(u64, FileType, String)> = vec![
+                        (ino, FileType::Directory, ".".to_string()),
+                        (parent_ino, FileType::Directory, "..".to_string()),
+                    ];
+
+                    for entry in read_dir.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let child_path = info.path.join(&name);
+                        if let Ok(metadata) = std::fs::symlink_metadata(&child_path) {
+                            let key = underlying_key_from_metadata(&metadata, info.key.generation);
+                            let (child_ino, _) = self.inodes.get_or_insert(child_path, key, ino);
+                            let file_type = if metadata.is_dir() {
+                                FileType::Directory
+                            } else if metadata.is_symlink() {
+                                FileType::Symlink
+                            } else {
+                                FileType::RegularFile
+                            };
+                            entries.push((child_ino, file_type, name));
+                        }
+                    }
+
+                    for (i, (entry_ino, kind, name)) in
+                        entries.into_iter().enumerate().skip(offset as usize)
+                    {
+                        if reply.add(entry_ino, (i + 1) as i64, kind, &name) {
+                            break;
+                        }
+                    }
+                    reply.ok();
+                    return;
+                }
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match node {
+            VirtualNode::Root => {
+                // Should have been handled above
+                reply.error(libc::ENOENT);
+            }
+            VirtualNode::Owner(owner) => {
+                // List cached repos for this owner
+                let cached_repos = self.list_cached_repos(&owner);
+
+                let mut entries: Vec<(u64, FileType, String)> = vec![
+                    (ino, FileType::Directory, ".".to_string()),
+                    (ROOT_INO, FileType::Directory, "..".to_string()),
+                ];
+
+                for repo in cached_repos {
+                    if let Ok(repo_ino) = self.get_or_create_repo(ino, &owner, &repo) {
+                        entries.push((repo_ino, FileType::Directory, repo));
+                    }
+                }
+
+                for (i, (entry_ino, kind, name)) in
+                    entries.into_iter().enumerate().skip(offset as usize)
+                {
+                    if reply.add(entry_ino, (i + 1) as i64, kind, &name) {
+                        break;
+                    }
+                }
+                reply.ok();
+            }
+            VirtualNode::Repo {
+                owner,
+                repo,
+                parent: repo_parent,
+            } => {
+                // Reading repo directory - triggers materialization
+                let (gen_path, gen_id) = match self.ensure_repo_materialized(&owner, &repo) {
+                    Some(p) => p,
+                    None => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                };
+
+                let read_dir = match std::fs::read_dir(&gen_path) {
+                    Ok(rd) => rd,
+                    Err(_) => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                };
+
+                let mut entries: Vec<(u64, FileType, String)> = vec![
+                    (ino, FileType::Directory, ".".to_string()),
+                    (repo_parent, FileType::Directory, "..".to_string()),
+                ];
+
+                for entry in read_dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let child_path = gen_path.join(&name);
+                    if let Ok(metadata) = std::fs::symlink_metadata(&child_path) {
+                        let key = underlying_key_from_metadata(&metadata, gen_id);
+                        let (child_ino, _) = self.inodes.get_or_insert(child_path, key, ino);
+                        let file_type = if metadata.is_dir() {
+                            FileType::Directory
+                        } else if metadata.is_symlink() {
+                            FileType::Symlink
+                        } else {
+                            FileType::RegularFile
+                        };
+                        entries.push((child_ino, file_type, name));
+                    }
+                }
+
+                for (i, (entry_ino, kind, name)) in
+                    entries.into_iter().enumerate().skip(offset as usize)
+                {
+                    if reply.add(entry_ino, (i + 1) as i64, kind, &name) {
+                        break;
+                    }
+                }
+                reply.ok();
+            }
+        }
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -485,8 +665,13 @@ impl Filesystem for GhFs {
         match File::open(&info.path) {
             Ok(file) => {
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-                self.open_files.lock().unwrap().insert(fh, file);
-                reply.opened(fh, 0);
+                match self.open_files.lock() {
+                    Ok(mut files) => {
+                        files.insert(fh, file);
+                        reply.opened(fh, 0);
+                    }
+                    Err(_) => reply.error(libc::EIO),
+                }
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
@@ -503,7 +688,13 @@ impl Filesystem for GhFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let mut files = self.open_files.lock().unwrap();
+        let mut files = match self.open_files.lock() {
+            Ok(f) => f,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         let file = match files.get_mut(&fh) {
             Some(f) => f,
             None => {
@@ -536,7 +727,9 @@ impl Filesystem for GhFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.open_files.lock().unwrap().remove(&fh);
+        if let Ok(mut files) = self.open_files.lock() {
+            files.remove(&fh);
+        }
         reply.ok();
     }
 
