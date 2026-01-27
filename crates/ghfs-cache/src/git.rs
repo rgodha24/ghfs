@@ -15,7 +15,7 @@
 
 use git2::Repository;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -146,6 +146,7 @@ impl GitCli {
         cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
         cmd.env("GIT_TERMINAL_PROMPT", "0");
         cmd.args(["-c", "core.hooksPath="]);
+        cmd.stdin(Stdio::null());
         cmd
     }
 
@@ -157,6 +158,8 @@ impl GitCli {
         // Validate inputs to prevent injection attacks
         validate_name(owner, "owner")?;
         validate_name(repo, "repo")?;
+
+        let dest_existed = dest.exists();
 
         // Create parent directories if they don't exist
         if let Some(parent) = dest.parent() {
@@ -177,6 +180,9 @@ impl GitCli {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if !dest_existed {
+                let _ = std::fs::remove_dir_all(dest);
+            }
             return Err(GitError::CloneError(stderr.into_owned()));
         }
 

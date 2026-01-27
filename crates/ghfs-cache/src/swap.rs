@@ -13,24 +13,30 @@ static SWAP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// This is atomic on POSIX: creates a temp symlink, then renames it.
 /// The rename is atomic, so readers never see a broken state.
 pub fn atomic_symlink_swap(link_path: &Path, new_target: &Path) -> io::Result<()> {
-    // Generate a unique temp symlink path: {link_path}.tmp.{pid}.{counter}
-    // Using PID + atomic counter guarantees uniqueness across threads
-    let counter = SWAP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let unique_id = format!("{}.{}", std::process::id(), counter);
+    loop {
+        // Generate a unique temp symlink path: {link_path}.tmp.{pid}.{counter}
+        // Using PID + atomic counter guarantees uniqueness across threads.
+        // Retry if the temp path already exists (e.g., from a prior crash).
+        let counter = SWAP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let unique_id = format!("{}.{}", std::process::id(), counter);
+        let temp_path = link_path.with_extension(format!("tmp.{}", unique_id));
 
-    let temp_path = link_path.with_extension(format!("tmp.{}", unique_id));
+        // Create symlink at temp path pointing to new_target
+        match symlink(new_target, &temp_path) {
+            Ok(()) => {
+                // Rename temp symlink to link_path (atomic on POSIX)
+                // If rename fails, clean up the temp symlink
+                if let Err(e) = std::fs::rename(&temp_path, link_path) {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(e);
+                }
 
-    // Create symlink at temp path pointing to new_target
-    symlink(new_target, &temp_path)?;
-
-    // Rename temp symlink to link_path (atomic on POSIX)
-    // If rename fails, clean up the temp symlink
-    if let Err(e) = std::fs::rename(&temp_path, link_path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-
-    Ok(())
 }
 
 /// Read the target of a symlink, returning None if it doesn't exist.
@@ -160,5 +166,31 @@ mod tests {
         assert!(link.is_symlink());
         let final_target = std::fs::read_link(link.as_ref()).unwrap();
         assert!(targets.contains(&final_target));
+    }
+
+    #[test]
+    fn test_atomic_symlink_swap_retries_on_existing_temp_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let target1 = temp_dir.path().join("target1");
+        let target2 = temp_dir.path().join("target2");
+        let link = temp_dir.path().join("current");
+
+        std::fs::create_dir(&target1).unwrap();
+        std::fs::create_dir(&target2).unwrap();
+
+        // Force the counter to 0 so we can predict the first temp path.
+        SWAP_COUNTER.store(0, Ordering::Relaxed);
+        let pid = std::process::id();
+        let temp_path = link.with_extension(format!("tmp.{}.0", pid));
+
+        // Pre-create the temp symlink to force a retry.
+        std::os::unix::fs::symlink(&target1, &temp_path).unwrap();
+
+        // Should succeed despite the existing temp path.
+        atomic_symlink_swap(&link, &target2).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), target2);
+
+        // Clean up the pre-created temp symlink if it still exists.
+        let _ = std::fs::remove_file(&temp_path);
     }
 }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 dirs = "6"
+fs2 = "0.4"
 ghfs-types = { path = "../ghfs-types" }
 # Only using libgit2 for local read operations (open, resolve refs, exists check).
 # HTTPS operations (clone, fetch) are done via CLI for shallow clone support.
