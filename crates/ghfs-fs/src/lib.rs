@@ -24,7 +24,14 @@ pub use inode::{
     VIRTUAL_INO_START,
 };
 
-const TTL: Duration = Duration::from_secs(1);
+/// TTL for virtual root and owner directories - can change when cache is updated
+const VIRTUAL_TTL: Duration = Duration::from_secs(60);
+
+/// TTL for repo boundary - short so generation changes are visible
+const REPO_TTL: Duration = Duration::from_secs(5);
+
+/// TTL for files inside a generation - long since generations are immutable
+const FILE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
 /// Virtual node types for dynamic owner/repo hierarchy
 #[derive(Debug, Clone)]
@@ -324,8 +331,12 @@ impl Filesystem for GhFs {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         // Virtual inodes - check if it exists in our virtual_nodes map
         if InodeTable::is_virtual(ino) {
-            if self.virtual_nodes.contains_key(&ino) {
-                reply.attr(&TTL, &self.dir_attr(ino));
+            if let Some(node) = self.virtual_nodes.get(&ino) {
+                let ttl = match node.value() {
+                    VirtualNode::Root | VirtualNode::Owner(_) => VIRTUAL_TTL,
+                    VirtualNode::Repo { .. } => REPO_TTL,
+                };
+                reply.attr(&ttl, &self.dir_attr(ino));
             } else {
                 reply.error(libc::ENOENT);
             }
@@ -345,7 +356,7 @@ impl Filesystem for GhFs {
         match std::fs::symlink_metadata(&info.path) {
             Ok(metadata) => {
                 let attr = metadata_to_attr(ino, &metadata);
-                reply.attr(&TTL, &attr);
+                reply.attr(&FILE_TTL, &attr);
             }
             Err(_) => reply.error(libc::EIO),
         }
@@ -375,7 +386,7 @@ impl Filesystem for GhFs {
                     return;
                 }
             };
-            reply.entry(&TTL, &self.dir_attr(owner_ino), 0);
+            reply.entry(&VIRTUAL_TTL, &self.dir_attr(owner_ino), 0);
             return;
         }
 
@@ -401,7 +412,7 @@ impl Filesystem for GhFs {
                                 underlying_key_from_metadata(&metadata, parent_info.key.generation);
                             let (ino, _) = self.inodes.get_or_insert(child_path, key, parent);
                             let attr = metadata_to_attr(ino, &metadata);
-                            reply.entry(&TTL, &attr, 0);
+                            reply.entry(&FILE_TTL, &attr, 0);
                         }
                         Err(_) => reply.error(libc::ENOENT),
                     }
@@ -428,7 +439,7 @@ impl Filesystem for GhFs {
                         return;
                     }
                 };
-                reply.entry(&TTL, &self.dir_attr(repo_ino), 0);
+                reply.entry(&REPO_TTL, &self.dir_attr(repo_ino), 0);
             }
             VirtualNode::Repo { owner, repo, .. } => {
                 // Looking up inside a repo - this triggers materialization
@@ -446,7 +457,7 @@ impl Filesystem for GhFs {
                         let key = underlying_key_from_metadata(&metadata, gen_id);
                         let (ino, _) = self.inodes.get_or_insert(child_path, key, parent);
                         let attr = metadata_to_attr(ino, &metadata);
-                        reply.entry(&TTL, &attr, 0);
+                        reply.entry(&FILE_TTL, &attr, 0);
                     }
                     Err(_) => reply.error(libc::ENOENT),
                 }
@@ -757,5 +768,19 @@ impl Filesystem for GhFs {
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+        // Return generic stats - we're read-only so most don't matter
+        reply.statfs(
+            0,   // blocks
+            0,   // bfree
+            0,   // bavail
+            0,   // files
+            0,   // ffree
+            512, // bsize
+            255, // namelen
+            0,   // frsize
+        );
     }
 }
