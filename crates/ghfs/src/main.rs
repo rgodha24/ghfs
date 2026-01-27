@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use ghfs_fs::GhFs;
 use ghfs_types::RepoKey;
 
 #[derive(Parser)]
@@ -35,11 +36,18 @@ enum Commands {
 }
 
 fn main() {
+    env_logger::init();
+
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Mount { mountpoint } => {
-            println!("Mounting at {}", mountpoint.display());
+            println!("Mounting ghfs at {}", mountpoint.display());
+            let fs = GhFs::with_default_cache();
+            if let Err(e) = fs.mount(&mountpoint) {
+                eprintln!("Mount failed: {}", e);
+                std::process::exit(1);
+            }
         }
         Commands::Unmount { mountpoint } => {
             println!("Unmounting {}", mountpoint.display());
