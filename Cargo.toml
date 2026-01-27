@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ghfs",
+    "crates/ghfs-fs",
+    "crates/ghfs-cache",
+    "crates/ghfs-types",
+]

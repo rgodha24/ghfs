@@ -1,0 +1,8 @@
+[package]
+name = "ghfs-fs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ghfs-types = { path = "../ghfs-types" }
+ghfs-cache = { path = "../ghfs-cache" }
