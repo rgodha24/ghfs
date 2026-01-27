@@ -36,6 +36,7 @@
             
             # Build dependencies
             pkgs.pkg-config
+            pkgs.openssl
             
             # Git (for testing)
             pkgs.git
