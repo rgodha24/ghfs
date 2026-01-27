@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Key for underlying file identity: (device, inode, generation)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnderlyingKey {
+    /// Device ID from the underlying filesystem.
     pub dev: u64,
+    /// Inode number from the underlying filesystem.
     pub ino: u64,
+    /// Cache generation ID for disambiguating reused inodes.
     pub generation: GenerationId,
 }
 
@@ -39,13 +42,17 @@ pub struct InodeTable {
     reverse: DashMap<UnderlyingKey, u64>,
 }
 
-/// Reserved inodes for virtual entries
+/// Reserved inode for the virtual filesystem root.
 pub const ROOT_INO: u64 = 1;
+/// First inode in the virtual inode range.
 pub const VIRTUAL_INO_START: u64 = 2;
+/// Last inode in the virtual inode range (inclusive).
 pub const VIRTUAL_INO_END: u64 = 1000; // Reserve first 1000 for virtual nodes
+/// First inode for passthrough (real) filesystem entries.
 pub const PASSTHROUGH_INO_START: u64 = 1001;
 
 impl InodeTable {
+    /// Create a new inode table with empty mappings.
     pub fn new() -> Self {
         Self {
             next_ino: AtomicU64::new(PASSTHROUGH_INO_START),

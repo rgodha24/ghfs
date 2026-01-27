@@ -11,24 +11,34 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
+/// Errors returned by cache operations.
 #[derive(Error, Debug)]
 pub enum CacheError {
+    /// A git operation failed.
     #[error("git error: {0}")]
     Git(#[from] crate::git::GitError),
+    /// An underlying IO operation failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Failed to acquire the repository lock within the timeout.
     #[error("lock acquisition failed")]
     LockFailed,
+    /// A generation directory name could not be parsed.
     #[error("invalid generation directory name: {0}")]
     InvalidGenerationName(String),
+    /// The current symlink points at a missing target.
     #[error("symlink target does not exist: {0}")]
     SymlinkTargetMissing(PathBuf),
 }
 
 /// A reference to a materialized repo generation.
+#[derive(Debug, Clone)]
 pub struct GenerationRef {
+    /// Filesystem path to the generation worktree.
     pub path: PathBuf,
+    /// Generation identifier for this worktree.
     pub generation: GenerationId,
+    /// Resolved commit SHA for the generation's HEAD.
     pub commit: String,
 }
 
@@ -56,6 +66,7 @@ fn cleanup_worktree(path: &Path) {
 }
 
 impl RepoCache {
+    /// Create a new cache manager rooted at the provided cache paths.
     pub fn new(paths: CachePaths) -> Self {
         Self {
             paths,
@@ -64,9 +75,15 @@ impl RepoCache {
         }
     }
 
+    /// Set the maximum age for cached generations before refresh.
     pub fn with_max_age(mut self, max_age: Duration) -> Self {
         self.max_age = max_age;
         self
+    }
+
+    /// Return the cache paths used by this cache manager.
+    pub fn paths(&self) -> &CachePaths {
+        &self.paths
     }
 
     /// Ensure a repo is materialized and current.
@@ -88,7 +105,11 @@ impl RepoCache {
 
         // Slow path: need to materialize or refresh
         let lock_path = self.paths.lock_path(key);
-        let _lock = RepoLock::acquire(&lock_path)?;
+        let _lock = match RepoLock::acquire(&lock_path) {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(CacheError::LockFailed),
+            Err(e) => return Err(CacheError::Io(e)),
+        };
 
         // Re-check under lock (another process may have updated)
         if current_link.exists() && !is_stale(&current_link, self.max_age) {

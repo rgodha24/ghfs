@@ -9,3 +9,4 @@ ghfs-cache = { path = "../ghfs-cache" }
 ghfs-types = { path = "../ghfs-types" }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
+dirs = "5"

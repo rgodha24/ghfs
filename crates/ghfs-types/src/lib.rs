@@ -118,7 +118,9 @@ impl fmt::Display for Repo {
 /// Identifies a specific GitHub repository (owner + repo)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepoKey {
+    /// Repository owner (user or organization).
     pub owner: Owner,
+    /// Repository name.
     pub repo: Repo,
 }
 

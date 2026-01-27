@@ -18,22 +18,31 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use thiserror::Error;
 
+/// Errors returned by git operations.
 #[derive(Error, Debug)]
 pub enum GitError {
+    /// libgit2 reported an error.
     #[error("git operation failed: {0}")]
     Git(#[from] git2::Error),
+    /// Repository path does not contain a git repo.
     #[error("repository not found at {0}")]
     NotFound(String),
+    /// Output parsing or unexpected git data.
     #[error("failed to parse git data: {0}")]
     ParseError(String),
+    /// Worktree creation failed.
     #[error("worktree creation failed: {0}")]
     WorktreeError(String),
+    /// Clone failed.
     #[error("clone failed: {0}")]
     CloneError(String),
+    /// Fetch failed.
     #[error("fetch failed: {0}")]
     FetchError(String),
+    /// Underlying IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Invalid inputs were provided.
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }

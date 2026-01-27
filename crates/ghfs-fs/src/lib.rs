@@ -7,7 +7,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, Request,
 };
 use ghfs_cache::{CachePaths, RepoCache};
-use ghfs_types::{GenerationId, RepoKey};
+use ghfs_types::{GenerationId, Owner, Repo, RepoKey};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -80,11 +80,10 @@ pub struct GhFs {
     virtual_names: DashMap<(u64, String), u64>,
     /// Next virtual inode to allocate (starts at 2, since 1 is root)
     next_virtual_ino: AtomicU64,
-    /// Cache of materialized repo paths: (owner, repo) -> (path, generation_id)
-    repo_generations: DashMap<(String, String), (PathBuf, GenerationId)>,
 }
 
 impl GhFs {
+    /// Create a new filesystem instance backed by the provided cache.
     pub fn new(cache: Arc<RepoCache>) -> Self {
         // Cache uid/gid at startup to avoid repeated unsafe calls
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -103,10 +102,10 @@ impl GhFs {
             virtual_nodes,
             virtual_names: DashMap::new(),
             next_virtual_ino: AtomicU64::new(VIRTUAL_INO_START), // Start at 2
-            repo_generations: DashMap::new(),
         }
     }
 
+    /// Create a filesystem instance using the default cache location.
     pub fn with_default_cache() -> Self {
         let paths = CachePaths::default();
         let cache = Arc::new(RepoCache::new(paths));
@@ -165,25 +164,13 @@ impl GhFs {
     /// Ensure a repo is materialized and return its generation path and ID.
     /// Called when traversing INTO a repo (lookup child or readdir).
     fn ensure_repo_materialized(&self, owner: &str, repo: &str) -> Option<(PathBuf, GenerationId)> {
-        let cache_key = (owner.to_string(), repo.to_string());
-
-        // Fast path: check if already cached
-        if let Some(entry) = self.repo_generations.get(&cache_key) {
-            return Some(entry.clone());
-        }
-
-        // Slow path: materialize the repo
         let key_str = format!("{}/{}", owner, repo);
         let key: RepoKey = match key_str.parse() {
             Ok(k) => k,
             Err(_) => return None,
         };
         match self.cache.ensure_current(&key) {
-            Ok(g) => {
-                let result = (g.path.clone(), g.generation);
-                self.repo_generations.insert(cache_key, result.clone());
-                Some(result)
-            }
+            Ok(g) => Some((g.path.clone(), g.generation)),
             Err(e) => {
                 log::error!("Failed to materialize repo {}/{}: {}", owner, repo, e);
                 None
@@ -193,14 +180,16 @@ impl GhFs {
 
     /// List cached owners by scanning the worktrees directory
     fn list_cached_owners(&self) -> Vec<String> {
-        let worktrees_dir = self.cache_paths().worktrees_dir();
+        let worktrees_dir = self.cache.paths().worktrees_dir();
         let mut owners = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     if let Some(name) = entry.file_name().to_str() {
-                        owners.push(name.to_string());
+                        if Self::is_valid_owner(name) {
+                            owners.push(name.to_string());
+                        }
                     }
                 }
             }
@@ -211,14 +200,16 @@ impl GhFs {
 
     /// List cached repos for an owner by scanning their worktrees directory
     fn list_cached_repos(&self, owner: &str) -> Vec<String> {
-        let owner_dir = self.cache_paths().worktrees_dir().join(owner);
+        let owner_dir = self.cache.paths().worktrees_dir().join(owner);
         let mut repos = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&owner_dir) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     if let Some(name) = entry.file_name().to_str() {
-                        repos.push(name.to_string());
+                        if Self::is_valid_repo(name) {
+                            repos.push(name.to_string());
+                        }
                     }
                 }
             }
@@ -227,40 +218,24 @@ impl GhFs {
         repos
     }
 
-    /// Get cache paths for directory scanning
-    fn cache_paths(&self) -> CachePaths {
-        // We need to get the paths from the cache
-        // Since RepoCache doesn't expose paths, we'll use default for now
-        // In a real implementation, we'd want RepoCache to expose its paths
-        CachePaths::default()
+    /// Check if a name is a valid GitHub owner.
+    fn is_valid_owner(name: &str) -> bool {
+        name.parse::<Owner>().is_ok()
     }
 
-    /// Check if a name is a valid GitHub owner/repo name
-    fn is_valid_github_name(name: &str) -> bool {
-        !name.is_empty()
-            && !name.starts_with('.')
-            && !name.starts_with('-')
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    /// Check if a name is a valid GitHub repository name.
+    fn is_valid_repo(name: &str) -> bool {
+        name.parse::<Repo>().is_ok()
     }
 
     /// Mount the filesystem at the given path.
     pub fn mount(self, mountpoint: &std::path::Path) -> std::io::Result<()> {
-        let mut options = vec![
+        let options = vec![
             MountOption::RO, // Read-only
             MountOption::FSName("ghfs".to_string()),
-            MountOption::AutoUnmount, // Unmount when process exits
+            // Note: AutoUnmount requires allow_other which needs user_allow_other in /etc/fuse.conf
+            // We skip it to avoid permission issues - user must manually unmount
         ];
-
-        // AllowOther requires user_allow_other in /etc/fuse.conf, try without if it fails
-        if std::path::Path::new("/etc/fuse.conf").exists() {
-            if let Ok(content) = std::fs::read_to_string("/etc/fuse.conf") {
-                if content.lines().any(|l| l.trim() == "user_allow_other") {
-                    options.push(MountOption::AllowOther);
-                }
-            }
-        }
 
         fuser::mount2(self, mountpoint, &options)?;
         Ok(())
@@ -373,7 +348,7 @@ impl Filesystem for GhFs {
 
         // Root directory lookups - dynamically create owner nodes
         if parent == ROOT_INO {
-            if !Self::is_valid_github_name(name_str) {
+            if !Self::is_valid_owner(name_str) {
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -426,7 +401,7 @@ impl Filesystem for GhFs {
         match parent_node {
             VirtualNode::Owner(owner) => {
                 // Looking up a repo under an owner
-                if !Self::is_valid_github_name(name_str) {
+                if !Self::is_valid_repo(name_str) {
                     reply.error(libc::ENOENT);
                     return;
                 }
@@ -699,6 +674,10 @@ impl Filesystem for GhFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
         let mut files = match self.open_files.lock() {
             Ok(f) => f,
             Err(_) => {
