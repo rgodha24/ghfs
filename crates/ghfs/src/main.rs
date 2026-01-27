@@ -33,6 +33,11 @@ enum Commands {
         /// Repository in owner/repo format
         repo: RepoKey,
     },
+    /// Force refresh a repository (ignores staleness)
+    Refresh {
+        /// Repository in owner/repo format
+        repo: RepoKey,
+    },
 }
 
 fn main() {
@@ -169,6 +174,24 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Failed to prefetch: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Refresh { repo } => {
+            println!("Refreshing {}...", repo);
+
+            let paths = ghfs_cache::CachePaths::default();
+            let cache = ghfs_cache::RepoCache::new(paths);
+
+            match cache.force_refresh(&repo) {
+                Ok(generation) => {
+                    println!("Refreshed at: {}", generation.path.display());
+                    println!("Commit: {}", generation.commit);
+                    println!("Generation: {}", generation.generation);
+                }
+                Err(e) => {
+                    eprintln!("Failed to refresh: {}", e);
                     std::process::exit(1);
                 }
             }

@@ -86,6 +86,33 @@ impl RepoCache {
         &self.paths
     }
 
+    /// Force refresh a repo, ignoring staleness.
+    /// Returns a reference to the new generation.
+    ///
+    /// This will:
+    /// 1. Clone if not present
+    /// 2. Fetch and create new generation if present
+    pub fn force_refresh(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
+        let lock_path = self.paths.lock_path(key);
+        let _lock = match RepoLock::acquire(&lock_path) {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(CacheError::LockFailed)
+            }
+            Err(e) => return Err(CacheError::Io(e)),
+        };
+
+        let mirror_path = self.paths.mirror_dir(key);
+
+        if !mirror_path.exists() {
+            self.initial_clone(key)?;
+        } else {
+            self.refresh(key)?;
+        }
+
+        self.read_current_ref(key)
+    }
+
     /// Ensure a repo is materialized and current.
     /// Returns a reference to the current generation.
     ///
@@ -107,7 +134,9 @@ impl RepoCache {
         let lock_path = self.paths.lock_path(key);
         let _lock = match RepoLock::acquire(&lock_path) {
             Ok(lock) => lock,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(CacheError::LockFailed),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(CacheError::LockFailed)
+            }
             Err(e) => return Err(CacheError::Io(e)),
         };
 
@@ -144,9 +173,9 @@ impl RepoCache {
         let mirror_path = self.paths.mirror_dir(key);
 
         // Clone bare shallow
-        if let Err(err) = self
-            .git
-            .clone_bare_shallow(key.owner.as_str(), key.repo.as_str(), &mirror_path)
+        if let Err(err) =
+            self.git
+                .clone_bare_shallow(key.owner.as_str(), key.repo.as_str(), &mirror_path)
         {
             let _ = std::fs::remove_dir_all(&mirror_path);
             return Err(err.into());
