@@ -7,3 +7,4 @@ edition = "2024"
 ghfs-fs = { path = "../ghfs-fs" }
 ghfs-cache = { path = "../ghfs-cache" }
 ghfs-types = { path = "../ghfs-types" }
+clap = { version = "4", features = ["derive"] }
