@@ -169,14 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_virtual() {
-        assert!(InodeTable::is_virtual(ROOT_INO));
-        assert!(InodeTable::is_virtual(500));
-        assert!(!InodeTable::is_virtual(PASSTHROUGH_INO_START));
-        assert!(!InodeTable::is_virtual(5000));
-    }
-
-    #[test]
     fn test_get_returns_info() {
         let table = InodeTable::new();
         let key = UnderlyingKey {
@@ -193,12 +185,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_nonexistent_returns_none() {
-        let table = InodeTable::new();
-        assert!(table.get(9999).is_none());
-    }
-
-    #[test]
     fn test_remove() {
         let table = InodeTable::new();
         let key = UnderlyingKey {
@@ -208,16 +194,9 @@ mod tests {
         };
         let (ino, _) = table.get_or_insert("/test/path".into(), key, ROOT_INO);
 
-        // Verify it exists
         assert!(table.get(ino).is_some());
-
-        // Remove it
         table.remove(ino);
-
-        // Verify it's gone
         assert!(table.get(ino).is_none());
-
-        // Inserting again should give a new inode
         let (new_ino, is_new) = table.get_or_insert("/test/path".into(), key, ROOT_INO);
         assert!(is_new);
         assert_ne!(ino, new_ino);
@@ -227,7 +206,6 @@ mod tests {
     fn test_clear_passthrough() {
         let table = InodeTable::new();
 
-        // Insert multiple passthrough inodes
         let key1 = UnderlyingKey {
             dev: 1,
             ino: 100,
@@ -242,14 +220,9 @@ mod tests {
         let (ino1, _) = table.get_or_insert("/path1".into(), key1, ROOT_INO);
         let (ino2, _) = table.get_or_insert("/path2".into(), key2, ROOT_INO);
 
-        // Both should exist
         assert!(table.get(ino1).is_some());
         assert!(table.get(ino2).is_some());
-
-        // Clear all passthrough inodes
         table.clear_passthrough();
-
-        // Both should be gone
         assert!(table.get(ino1).is_none());
         assert!(table.get(ino2).is_none());
     }

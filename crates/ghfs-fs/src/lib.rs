@@ -1,7 +1,7 @@
 //! GHFS FUSE filesystem implementation.
 
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request,
@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod inode;
 
 pub use inode::{
-    InodeInfo, InodeTable, PASSTHROUGH_INO_START, ROOT_INO, UnderlyingKey, VIRTUAL_INO_END,
+    InodeInfo, InodeTable, UnderlyingKey, PASSTHROUGH_INO_START, ROOT_INO, VIRTUAL_INO_END,
     VIRTUAL_INO_START,
 };
 
@@ -346,14 +346,12 @@ impl Filesystem for GhFs {
             }
         };
 
-        // Root directory lookups - dynamically create owner nodes
         if parent == ROOT_INO {
             if !Self::is_valid_owner(name_str) {
                 reply.error(libc::ENOENT);
                 return;
             }
 
-            // Create or get owner node
             let owner_ino = match self.get_or_create_owner(name_str) {
                 Ok(ino) => ino,
                 Err(e) => {
@@ -365,13 +363,10 @@ impl Filesystem for GhFs {
             return;
         }
 
-        // Check if parent is a virtual node
         let parent_node = match self.virtual_nodes.get(&parent) {
             Some(node) => node.clone(),
             None => {
-                // Not a virtual node, check passthrough
                 if !InodeTable::is_virtual(parent) {
-                    // Passthrough lookup
                     let parent_info = match self.inodes.get(parent) {
                         Some(info) => info,
                         None => {
@@ -400,13 +395,11 @@ impl Filesystem for GhFs {
 
         match parent_node {
             VirtualNode::Owner(owner) => {
-                // Looking up a repo under an owner
                 if !Self::is_valid_repo(name_str) {
                     reply.error(libc::ENOENT);
                     return;
                 }
 
-                // Create or get repo node
                 let repo_ino = match self.get_or_create_repo(parent, &owner, name_str) {
                     Ok(ino) => ino,
                     Err(e) => {
@@ -417,7 +410,6 @@ impl Filesystem for GhFs {
                 reply.entry(&REPO_TTL, &self.dir_attr(repo_ino), 0);
             }
             VirtualNode::Repo { owner, repo, .. } => {
-                // Looking up inside a repo - this triggers materialization
                 let (gen_path, gen_id) = match self.ensure_repo_materialized(&owner, &repo) {
                     Some(p) => p,
                     None => {
@@ -438,7 +430,6 @@ impl Filesystem for GhFs {
                 }
             }
             VirtualNode::Root => {
-                // Should have been handled above
                 reply.error(libc::ENOENT);
             }
         }
@@ -453,7 +444,6 @@ impl Filesystem for GhFs {
         mut reply: ReplyDirectory,
     ) {
         if ino == ROOT_INO {
-            // List cached owners
             let cached_owners = self.list_cached_owners();
 
             let mut entries: Vec<(u64, FileType, String)> = vec![
@@ -478,13 +468,10 @@ impl Filesystem for GhFs {
             return;
         }
 
-        // Check if it's a virtual node
         let node = match self.virtual_nodes.get(&ino) {
             Some(n) => n.clone(),
             None => {
-                // Not a virtual node, check passthrough
                 if !InodeTable::is_virtual(ino) {
-                    // Passthrough readdir
                     let info = match self.inodes.get(ino) {
                         Some(info) => info,
                         None => {
@@ -541,11 +528,9 @@ impl Filesystem for GhFs {
 
         match node {
             VirtualNode::Root => {
-                // Should have been handled above
                 reply.error(libc::ENOENT);
             }
             VirtualNode::Owner(owner) => {
-                // List cached repos for this owner
                 let cached_repos = self.list_cached_repos(&owner);
 
                 let mut entries: Vec<(u64, FileType, String)> = vec![
@@ -573,7 +558,6 @@ impl Filesystem for GhFs {
                 repo,
                 parent: repo_parent,
             } => {
-                // Reading repo directory - triggers materialization
                 let (gen_path, gen_id) = match self.ensure_repo_materialized(&owner, &repo) {
                     Some(p) => p,
                     None => {

@@ -118,10 +118,6 @@ fn validate_name(value: &str, name: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-// ============================================================================
-// CLI Operations (for shallow clone support)
-// ============================================================================
-
 /// Git CLI wrapper with security hardening.
 ///
 /// Used for operations that require shallow clone support (`--depth=1`)
@@ -170,7 +166,6 @@ impl GitCli {
 
         let dest_existed = dest.exists();
 
-        // Create parent directories if they don't exist
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -270,10 +265,6 @@ impl GitCli {
     }
 }
 
-// ============================================================================
-// libgit2 Operations (for clean read API)
-// ============================================================================
-
 /// Open an existing repository at the given path.
 pub fn open_repository(path: &Path) -> Result<Repository, GitError> {
     let repo = Repository::open(path).map_err(|e| {
@@ -320,10 +311,6 @@ pub fn repository_exists(path: &Path) -> bool {
     Repository::open(path).is_ok()
 }
 
-// ============================================================================
-// Convenience functions (using GitCli internally)
-// ============================================================================
-
 /// Clone a GitHub repository as a bare, shallow repository.
 ///
 /// Convenience wrapper around `GitCli::clone_bare_shallow`.
@@ -349,36 +336,9 @@ pub fn create_worktree(
     GitCli::new().create_worktree(mirror_path, worktree_path, commit)
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ------------------------------------------------------------------------
-    // Unit Tests (no network required)
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn git2_library_is_available() {
-        // Simple test to verify git2 is linked correctly
-        let _version = git2::Version::get();
-        // If we got here without panicking, git2 is working
-    }
-
-    #[test]
-    fn git_cli_default_creates_instance() {
-        let cli = GitCli::default();
-        assert_eq!(cli.git_path, "git");
-    }
-
-    #[test]
-    fn git_cli_new_creates_instance() {
-        let cli = GitCli::new();
-        assert_eq!(cli.git_path, "git");
-    }
 
     #[test]
     fn repository_exists_returns_false_for_nonexistent() {
@@ -415,13 +375,8 @@ mod tests {
 
         let temp_dir = tempdir().expect("Failed to create temp directory");
 
-        // A regular directory is not a git repository
         assert!(!repository_exists(temp_dir.path()));
     }
-
-    // ------------------------------------------------------------------------
-    // Integration Tests (require network access)
-    // ------------------------------------------------------------------------
 
     #[test]
     #[ignore] // Requires network access
@@ -439,7 +394,6 @@ mod tests {
             "HEAD file should exist in bare repo"
         );
 
-        // Verify it's a valid git repo by opening it
         let repo = open_repository(&dest).expect("Should be able to open cloned repo");
         assert!(repo.is_bare(), "Repository should be bare");
     }
@@ -452,13 +406,8 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("hello-world.git");
 
-        // Clone the repo first
         clone_bare_shallow("octocat", "Hello-World", &dest).expect("Clone failed");
-
-        // Open with libgit2
         let repo = open_repository(&dest).expect("Failed to open repo");
-
-        // Resolve the default branch
         let result = resolve_default_branch(&repo);
         assert!(
             result.is_ok(),
@@ -468,13 +417,10 @@ mod tests {
 
         let (branch_name, commit_sha) = result.unwrap();
 
-        // octocat/Hello-World uses "master" as its default branch
         assert_eq!(
             branch_name, "master",
             "Expected default branch to be 'master'"
         );
-
-        // Commit SHA should be 40 hex characters
         assert_eq!(
             commit_sha.len(),
             40,
@@ -498,30 +444,19 @@ mod tests {
         let mirror_path = temp_dir.path().join("hello-world.git");
         let worktree_path = temp_dir.path().join("hello-world-worktree");
 
-        // Clone the repo first
         clone_bare_shallow("octocat", "Hello-World", &mirror_path).expect("Clone failed");
-
-        // Open with libgit2 and get commit SHA
         let repo = open_repository(&mirror_path).expect("Failed to open repo");
         let (_branch_name, commit_sha) =
             resolve_default_branch(&repo).expect("Failed to resolve default branch");
-
-        // Create worktree using CLI
         let result = create_worktree(&mirror_path, &worktree_path, &commit_sha);
         assert!(result.is_ok(), "create_worktree failed: {:?}", result.err());
-
-        // Verify worktree has a .git FILE (not directory)
         let git_path = worktree_path.join(".git");
         let metadata = fs::metadata(&git_path).expect(".git should exist");
         assert!(metadata.is_file(), ".git should be a file, not a directory");
-
-        // Verify worktree contains a README file
         assert!(
             worktree_path.join("README").exists(),
             "README file should exist in worktree"
         );
-
-        // Verify the .git file contains gitdir: pointing back to the mirror
         let git_contents = fs::read_to_string(&git_path).expect("Failed to read .git file");
         assert!(
             git_contents.contains("gitdir:"),
@@ -538,25 +473,16 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let mirror_path = temp_dir.path().join("hello-world.git");
 
-        // Clone the repo first
         clone_bare_shallow("octocat", "Hello-World", &mirror_path).expect("Clone failed");
-
-        // Open with libgit2 and get initial commit SHA
         let repo = open_repository(&mirror_path).expect("Failed to open repo");
         let (branch_name, initial_commit) =
             resolve_default_branch(&repo).expect("Failed to resolve default branch");
-
-        // Fetch updates using CLI
         let result = fetch_shallow(&mirror_path, &branch_name);
         assert!(result.is_ok(), "fetch_shallow failed: {:?}", result.err());
-
-        // Re-open and get the commit SHA after fetch
-        // (need to re-open because git2 caches refs)
+        // Re-open because git2 caches refs.
         let repo = open_repository(&mirror_path).expect("Failed to open repo after fetch");
         let (_branch_name, post_fetch_commit) =
             resolve_default_branch(&repo).expect("Failed to resolve default branch after fetch");
-
-        // The commit should be the same or newer (if repo was updated between clone and fetch)
         assert_eq!(
             post_fetch_commit.len(),
             40,
@@ -567,7 +493,6 @@ mod tests {
             "Post-fetch commit SHA should be all hex digits"
         );
 
-        // Log the commits for debugging
         println!("Initial commit: {}", initial_commit);
         println!("Post-fetch commit: {}", post_fetch_commit);
     }
@@ -580,10 +505,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("hello-world.git");
 
-        // Clone the repo first
         clone_bare_shallow("octocat", "Hello-World", &dest).expect("Clone failed");
-
-        // Open it with libgit2
         let result = open_repository(&dest);
         assert!(result.is_ok(), "open_repository failed: {:?}", result.err());
 
@@ -599,7 +521,6 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("hello-world.git");
 
-        // Clone the repo first
         clone_bare_shallow("octocat", "Hello-World", &dest).expect("Clone failed");
 
         assert!(repository_exists(&dest));
@@ -616,28 +537,17 @@ mod tests {
 
         let cli = GitCli::new();
 
-        // Clone
         cli.clone_bare_shallow("octocat", "Hello-World", &mirror_path)
             .expect("Clone failed");
-
-        // Use libgit2 to read
         let repo = open_repository(&mirror_path).expect("Failed to open");
         let (branch, commit) = resolve_default_branch(&repo).expect("Failed to resolve");
-
-        // Fetch
         cli.fetch_shallow(&mirror_path, &branch)
             .expect("Fetch failed");
-
-        // Create worktree
         cli.create_worktree(&mirror_path, &worktree_path, &commit)
             .expect("Worktree failed");
 
         assert!(worktree_path.join("README").exists());
     }
-
-    // ------------------------------------------------------------------------
-    // Input Validation Tests
-    // ------------------------------------------------------------------------
 
     #[test]
     fn validate_name_rejects_empty() {

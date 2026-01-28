@@ -104,12 +104,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("subdir").join("repo.lock");
 
-        // Lock file and parent dir shouldn't exist yet
         assert!(!lock_path.exists());
 
         let lock = RepoLock::acquire(&lock_path).unwrap();
 
-        // Lock file should now exist
         assert!(lock_path.exists());
 
         drop(lock);
@@ -120,10 +118,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("repo.lock");
 
-        // Acquire the lock
         let _lock = RepoLock::acquire(&lock_path).unwrap();
-
-        // Try to acquire again - should return None
         let result = RepoLock::try_acquire(&lock_path).unwrap();
         assert!(result.is_none());
     }
@@ -133,14 +128,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("repo.lock");
 
-        // Acquire and drop the lock
         {
             let _lock = RepoLock::acquire(&lock_path).unwrap();
-            // Lock is held here
             assert!(RepoLock::try_acquire(&lock_path).unwrap().is_none());
         }
-
-        // Lock should be released now
         let lock = RepoLock::try_acquire(&lock_path).unwrap();
         assert!(lock.is_some());
     }
@@ -154,18 +145,15 @@ mod tests {
         let lock_path_clone = Arc::clone(&lock_path);
         let barrier_clone = Arc::clone(&barrier);
 
-        // Thread 1: Acquire lock, wait at barrier, then release
         let handle1 = thread::spawn(move || {
             let lock = RepoLock::acquire(&lock_path_clone).unwrap();
-            barrier_clone.wait(); // Signal that lock is held
+            barrier_clone.wait();
             thread::sleep(std::time::Duration::from_millis(100));
             drop(lock);
         });
 
-        // Thread 2: Wait for thread 1 to acquire lock, then try to acquire
         let handle2 = thread::spawn(move || {
-            barrier.wait(); // Wait for thread 1 to acquire lock
-            // Thread 1 holds the lock, try_acquire should return None
+            barrier.wait();
             let result = RepoLock::try_acquire(&lock_path).unwrap();
             assert!(
                 result.is_none(),
@@ -186,17 +174,15 @@ mod tests {
         let lock_path_clone = Arc::clone(&lock_path);
         let barrier_clone = Arc::clone(&barrier);
 
-        // Thread 1: Acquire lock and hold it for a while
         let handle1 = thread::spawn(move || {
             let lock = RepoLock::acquire(&lock_path_clone).unwrap();
-            barrier_clone.wait(); // Signal that lock is held
-            thread::sleep(Duration::from_millis(500)); // Hold lock longer than timeout
+            barrier_clone.wait();
+            thread::sleep(Duration::from_millis(500));
             drop(lock);
         });
 
-        // Thread 2: Wait for thread 1 to acquire lock, then try to acquire with short timeout
         let handle2 = thread::spawn(move || {
-            barrier.wait(); // Wait for thread 1 to acquire lock
+            barrier.wait();
             let result = RepoLock::acquire_with_timeout(&lock_path, Duration::from_millis(100));
             assert!(result.is_err(), "Should have timed out");
             let err = result.unwrap_err();
@@ -216,18 +202,15 @@ mod tests {
         let lock_path_clone = Arc::clone(&lock_path);
         let barrier_clone = Arc::clone(&barrier);
 
-        // Thread 1: Acquire lock briefly then release
         let handle1 = thread::spawn(move || {
             let lock = RepoLock::acquire(&lock_path_clone).unwrap();
-            barrier_clone.wait(); // Signal that lock is held
-            thread::sleep(Duration::from_millis(50)); // Hold lock briefly
+            barrier_clone.wait();
+            thread::sleep(Duration::from_millis(50));
             drop(lock);
         });
 
-        // Thread 2: Wait for thread 1 to acquire lock, then try to acquire with timeout
         let handle2 = thread::spawn(move || {
-            barrier.wait(); // Wait for thread 1 to acquire lock
-            // Use a longer timeout; should succeed after thread 1 releases
+            barrier.wait();
             let result = RepoLock::acquire_with_timeout(&lock_path, Duration::from_secs(2));
             assert!(
                 result.is_ok(),

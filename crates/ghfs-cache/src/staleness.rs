@@ -66,14 +66,13 @@ mod tests {
         let link = dir.path().join("current");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        // Just created, should not be stale with 1 hour max age
         assert!(!is_stale(&link, Duration::from_secs(3600)));
     }
 
     #[test]
     #[cfg(unix)]
     fn test_is_stale_old_symlink() {
-        use filetime::{FileTime, set_symlink_file_times};
+        use filetime::{set_symlink_file_times, FileTime};
 
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");
@@ -82,22 +81,17 @@ mod tests {
         let link = dir.path().join("current");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        // Set mtime to 2 hours ago
         let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
         let ft = FileTime::from_system_time(two_hours_ago);
         set_symlink_file_times(&link, ft, ft).unwrap();
-
-        // Should be stale with 1 hour max age
         assert!(is_stale(&link, Duration::from_secs(3600)));
-
-        // Should not be stale with 3 hour max age
         assert!(!is_stale(&link, Duration::from_secs(10800)));
     }
 
     #[test]
     #[cfg(unix)]
     fn test_touch_symlink_updates_mtime() {
-        use filetime::{FileTime, set_symlink_file_times};
+        use filetime::{set_symlink_file_times, FileTime};
 
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");
@@ -106,21 +100,12 @@ mod tests {
         let link = dir.path().join("current");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        // Set mtime to 2 hours ago
         let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
         let ft = FileTime::from_system_time(two_hours_ago);
         set_symlink_file_times(&link, ft, ft).unwrap();
-
-        // Verify it's stale
         assert!(is_stale(&link, Duration::from_secs(3600)));
-
-        // Touch it
         touch_symlink(&link).unwrap();
-
-        // Should no longer be stale
         assert!(!is_stale(&link, Duration::from_secs(3600)));
-
-        // Verify symlink still points to same target
         assert_eq!(fs::read_link(&link).unwrap(), target);
     }
 }

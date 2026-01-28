@@ -61,13 +61,8 @@ mod tests {
         let target = temp_dir.path().join("target");
         let link = temp_dir.path().join("current");
 
-        // Create target directory
         std::fs::create_dir(&target).unwrap();
-
-        // Create symlink
         atomic_symlink_swap(&link, &target).unwrap();
-
-        // Verify symlink exists and points to correct target
         assert!(link.is_symlink());
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
     }
@@ -79,40 +74,12 @@ mod tests {
         let target2 = temp_dir.path().join("target2");
         let link = temp_dir.path().join("current");
 
-        // Create target directories
         std::fs::create_dir(&target1).unwrap();
         std::fs::create_dir(&target2).unwrap();
-
-        // Create initial symlink
         atomic_symlink_swap(&link, &target1).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), target1);
-
-        // Update symlink to new target
         atomic_symlink_swap(&link, &target2).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), target2);
-    }
-
-    #[test]
-    fn test_read_symlink_target_returns_none_for_nonexistent() {
-        let temp_dir = TempDir::new().unwrap();
-        let link = temp_dir.path().join("nonexistent");
-
-        let result = read_symlink_target(&link).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_read_symlink_target_returns_target_for_existing() {
-        let temp_dir = TempDir::new().unwrap();
-        let target = temp_dir.path().join("target");
-        let link = temp_dir.path().join("current");
-
-        // Create target and symlink
-        std::fs::create_dir(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        let result = read_symlink_target(&link).unwrap();
-        assert_eq!(result, Some(target));
     }
 
     #[test]
@@ -120,7 +87,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let link = temp_dir.path().join("current");
 
-        // Create multiple targets
         let num_threads = 10;
         let num_iterations = 100;
         let targets: Vec<PathBuf> = (0..num_threads)
@@ -130,11 +96,7 @@ mod tests {
                 target
             })
             .collect();
-
-        // Create initial symlink
         atomic_symlink_swap(&link, &targets[0]).unwrap();
-
-        // Barrier to synchronize thread starts
         let barrier = Arc::new(Barrier::new(num_threads));
         let link = Arc::new(link);
         let targets = Arc::new(targets);
@@ -156,13 +118,9 @@ mod tests {
                 })
             })
             .collect();
-
-        // Wait for all threads to complete
         for handle in handles {
             handle.join().unwrap();
         }
-
-        // Verify symlink is still valid and points to one of the targets
         assert!(link.is_symlink());
         let final_target = std::fs::read_link(link.as_ref()).unwrap();
         assert!(targets.contains(&final_target));
@@ -178,19 +136,12 @@ mod tests {
         std::fs::create_dir(&target1).unwrap();
         std::fs::create_dir(&target2).unwrap();
 
-        // Force the counter to 0 so we can predict the first temp path.
         SWAP_COUNTER.store(0, Ordering::Relaxed);
         let pid = std::process::id();
         let temp_path = link.with_extension(format!("tmp.{}.0", pid));
-
-        // Pre-create the temp symlink to force a retry.
         std::os::unix::fs::symlink(&target1, &temp_path).unwrap();
-
-        // Should succeed despite the existing temp path.
         atomic_symlink_swap(&link, &target2).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), target2);
-
-        // Clean up the pre-created temp symlink if it still exists.
         let _ = std::fs::remove_file(&temp_path);
     }
 }

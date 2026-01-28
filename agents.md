@@ -97,28 +97,12 @@ This provides: `rustc`, `cargo`, `fuse3`, `pkg-config`, `git`
 
 > **Note**: Nix devshell currently only provides fuse3 on Linux. macOS users should install macFUSE manually.
 
-### Manual Setup (Linux)
-
-```bash
-# Debian/Ubuntu
-sudo apt install libfuse3-dev pkg-config
-
-# Fedora
-sudo dnf install fuse3-devel pkg-config
-```
-
-### Manual Setup (macOS)
-
-1. Install macFUSE from https://osxfuse.github.io/
-2. Approve in Security & Privacy, reboot if prompted
-3. Install Rust via rustup
-
 ### Build & Test
 
 ```bash
-cargo build                    # Build all crates
-cargo test                     # Run all tests
-cargo run -- --help            # Run CLI (once implemented)
+nix develop -c cargo build                    # Build all crates
+nix develop -c cargo test                     # Run all tests
+nix develop -c cargo run -- --help            # Run CLI (once implemented)
 ```
 
 ## Commit Conventions
@@ -163,6 +147,7 @@ chore(nix): add fuse3 to devshell
 ### Commit Atomicity
 
 Each commit should:
+
 1. Be a single logical change
 2. Pass `cargo build` and `cargo test`
 3. Be reviewable in isolation
@@ -176,6 +161,7 @@ codex e 'review the changes in <file> for correctness and style'
 ```
 
 Or for broader review:
+
 ```bash
 codex e 'review recent changes, check for: error handling, unwrap usage, naming conventions'
 ```
@@ -183,40 +169,48 @@ codex e 'review recent changes, check for: error handling, unwrap usage, naming 
 ## Implementation Phases
 
 ### Phase 1: Project Structure + Core Types
+
 - Workspace skeleton
 - `Owner`, `Repo`, `RepoKey` types
 - `CachePaths` struct
 - CLI scaffolding
 
 ### Phase 2: Git Operations
+
 - `GitRunner` with hardening
 - Clone, fetch, worktree commands
 - Atomic symlink swap
 
 ### Phase 3: Cache Manager + Locking
+
 - File-based locking (`fs2`)
 - `RepoCache::ensure_current`
 - Concurrent access safety
 
 ### Phase 4: Minimal FUSE Mount
+
 - Basic `fuser` integration
 - Root inode handling
 - Single hardcoded repo
 
 ### Phase 5: Full Loopback Passthrough
+
 - Inode table
 - Virtual nodes for `/`, `/<owner>`, `/<owner>/<repo>`
 - All read operations
 
 ### Phase 6: TTL + Generation Boundaries
+
 - Entry TTL configuration
 - Generation-aware inodes
 
 ### Phase 7: Write Denial + Git Compatibility
+
 - `EROFS` for writes
 - Verify git commands work
 
 ### Phase 8: CLI Polish
+
 - Daemon mode
 - `ghfs doctor`
 - `ghfs prefetch`
@@ -234,10 +228,12 @@ codex e 'review recent changes, check for: error handling, unwrap usage, naming 
 ## Testing Strategy
 
 ### Unit Tests
+
 - In each crate's `src/` as `#[cfg(test)]` modules
 - Test parsing, path generation, inode allocation
 
 ### Integration Tests
+
 - In `tests/integration/`
 - Require FUSE (skip on CI without it)
 - Test actual mount/read/unmount cycles
@@ -253,10 +249,12 @@ cargo test --test integration        # Integration only
 ## Platform Notes
 
 ### Linux
+
 - Requires `libfuse3` or `fuse3` package
 - User must be in `fuse` group or use `allow_other` mount option
 
 ### macOS
+
 - Requires macFUSE installed (https://osxfuse.github.io/)
 - May need Security & Privacy approval + reboot
 - macFUSE ships both libfuse2 and libfuse3
