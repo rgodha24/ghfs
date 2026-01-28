@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ghfs_types::{GenerationId, RepoKey};
+use crate::types::{GenerationId, RepoKey};
 
 /// Manages all filesystem paths for the cache directory layout
 #[derive(Debug, Clone)]

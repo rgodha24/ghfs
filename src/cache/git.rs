@@ -340,6 +340,25 @@ pub fn create_worktree(
 mod tests {
     use super::*;
 
+    fn network_tests_enabled() -> bool {
+        match std::env::var("GHFS_RUN_NETWORK_TESTS") {
+            Ok(value) => {
+                let value = value.to_ascii_lowercase();
+                value == "1" || value == "true" || value == "yes"
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn require_network() -> bool {
+        if network_tests_enabled() {
+            true
+        } else {
+            eprintln!("skipping network test (set GHFS_RUN_NETWORK_TESTS=1)");
+            false
+        }
+    }
+
     #[test]
     fn repository_exists_returns_false_for_nonexistent() {
         use tempfile::tempdir;
@@ -379,8 +398,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn clone_bare_shallow_clones_real_repo() {
+        if !require_network() {
+            return;
+        }
         use tempfile::tempdir;
 
         let temp_dir = tempdir().expect("Failed to create temp directory");
@@ -399,8 +420,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn resolve_default_branch_works_on_hello_world() {
+        if !require_network() {
+            return;
+        }
         use tempfile::tempdir;
 
         let temp_dir = tempdir().expect("Failed to create temp directory");
@@ -435,8 +458,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn create_worktree_creates_detached_worktree() {
+        if !require_network() {
+            return;
+        }
         use std::fs;
         use tempfile::tempdir;
 
@@ -466,8 +491,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn fetch_shallow_updates_mirror() {
+        if !require_network() {
+            return;
+        }
         use tempfile::tempdir;
 
         let temp_dir = tempdir().expect("Failed to create temp directory");
@@ -498,8 +525,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn open_repository_works_after_clone() {
+        if !require_network() {
+            return;
+        }
         use tempfile::tempdir;
 
         let temp_dir = tempdir().expect("Failed to create temp directory");
@@ -514,8 +543,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn repository_exists_returns_true_for_cloned_repo() {
+        if !require_network() {
+            return;
+        }
         use tempfile::tempdir;
 
         let temp_dir = tempdir().expect("Failed to create temp directory");
@@ -527,8 +558,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn git_cli_methods_work_directly() {
+        if !require_network() {
+            return;
+        }
         use tempfile::tempdir;
 
         let temp_dir = tempdir().expect("Failed to create temp directory");

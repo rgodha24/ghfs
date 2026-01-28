@@ -1,8 +1,12 @@
 use std::path::PathBuf;
 
+pub mod cache;
+pub mod fs;
+pub mod types;
+
 use clap::{Parser, Subcommand};
-use ghfs_fs::GhFs;
-use ghfs_types::RepoKey;
+use crate::fs::GhFs;
+use crate::types::RepoKey;
 
 #[derive(Parser)]
 #[command(
@@ -168,8 +172,8 @@ fn main() {
         Commands::Prefetch { repo } => {
             println!("Prefetching {}...", repo);
 
-            let paths = ghfs_cache::CachePaths::default();
-            let cache = ghfs_cache::RepoCache::new(paths);
+            let paths = crate::cache::CachePaths::default();
+            let cache = crate::cache::RepoCache::new(paths);
 
             match cache.ensure_current(&repo) {
                 Ok(generation) => {
@@ -185,8 +189,8 @@ fn main() {
         Commands::Refresh { repo } => {
             println!("Refreshing {}...", repo);
 
-            let paths = ghfs_cache::CachePaths::default();
-            let cache = ghfs_cache::RepoCache::new(paths);
+            let paths = crate::cache::CachePaths::default();
+            let cache = crate::cache::RepoCache::new(paths);
 
             match cache.force_refresh(&repo) {
                 Ok(generation) => {

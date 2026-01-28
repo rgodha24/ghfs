@@ -6,8 +6,8 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request,
 };
-use ghfs_cache::{CachePaths, RepoCache};
-use ghfs_types::{GenerationId, Owner, Repo, RepoKey};
+use crate::cache::{CachePaths, RepoCache};
+use crate::types::{GenerationId, Owner, Repo, RepoKey};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;

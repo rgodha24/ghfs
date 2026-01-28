@@ -34,7 +34,7 @@ pub fn is_stale(current_symlink: &Path, max_age: Duration) -> bool {
 /// Uses atomic swap to avoid race conditions: creates a new symlink at a temp path,
 /// then atomically renames it over the original.
 pub fn touch_symlink(link_path: &Path) -> io::Result<()> {
-    use crate::swap::atomic_symlink_swap;
+    use super::swap::atomic_symlink_swap;
 
     // Read the current target
     let target = fs::read_link(link_path)?;

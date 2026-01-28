@@ -1,7 +1,7 @@
 //! Inode table management for the FUSE filesystem.
 
+use crate::types::GenerationId;
 use dashmap::DashMap;
-use ghfs_types::GenerationId;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 

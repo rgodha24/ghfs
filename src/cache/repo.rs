@@ -4,9 +4,9 @@
 //! that ties together all cache operations: cloning, fetching, worktree management,
 //! and symlink swapping.
 
-use crate::git::{open_repository, resolve_default_branch};
-use crate::{atomic_symlink_swap, is_stale, CachePaths, GitCli, RepoLock};
-use ghfs_types::{GenerationId, RepoKey};
+use super::git::{open_repository, resolve_default_branch};
+use super::{atomic_symlink_swap, is_stale, CachePaths, GitCli, RepoLock};
+use crate::types::{GenerationId, RepoKey};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -16,7 +16,7 @@ use thiserror::Error;
 pub enum CacheError {
     /// A git operation failed.
     #[error("git error: {0}")]
-    Git(#[from] crate::git::GitError),
+    Git(#[from] super::git::GitError),
     /// An underlying IO operation failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -278,10 +278,10 @@ impl RepoCache {
 
         // Read commit from worktree's HEAD
         let repo = open_repository(&target)?;
-        let head = repo.head().map_err(crate::git::GitError::Git)?;
+        let head = repo.head().map_err(super::git::GitError::Git)?;
         let commit = head
             .peel_to_commit()
-            .map_err(crate::git::GitError::Git)?
+            .map_err(super::git::GitError::Git)?
             .id()
             .to_string();
 
@@ -299,6 +299,25 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn network_tests_enabled() -> bool {
+        match std::env::var("GHFS_RUN_NETWORK_TESTS") {
+            Ok(value) => {
+                let value = value.to_ascii_lowercase();
+                value == "1" || value == "true" || value == "yes"
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn require_network() -> bool {
+        if network_tests_enabled() {
+            true
+        } else {
+            eprintln!("skipping network test (set GHFS_RUN_NETWORK_TESTS=1)");
+            false
+        }
+    }
 
     #[test]
     fn next_generation_returns_1_for_empty_dir() {
@@ -398,8 +417,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn ensure_current_clones_new_repo() {
+        if !require_network() {
+            return;
+        }
         let temp_dir = tempdir().unwrap();
         let paths = CachePaths::new(temp_dir.path());
         let cache = RepoCache::new(paths.clone());
@@ -425,8 +446,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn ensure_current_returns_immediately_if_fresh() {
+        if !require_network() {
+            return;
+        }
         let temp_dir = tempdir().unwrap();
         let paths = CachePaths::new(temp_dir.path());
         let cache = RepoCache::new(paths.clone()).with_max_age(Duration::from_secs(3600));
@@ -443,8 +466,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires network access
     fn ensure_current_refreshes_if_stale() {
+        if !require_network() {
+            return;
+        }
         let temp_dir = tempdir().unwrap();
         let paths = CachePaths::new(temp_dir.path());
         let cache = RepoCache::new(paths.clone()).with_max_age(Duration::from_secs(0));
@@ -471,8 +496,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // requires network
     fn concurrent_ensure_current_doesnt_corrupt() {
+        if !require_network() {
+            return;
+        }
         use std::sync::Arc;
         use std::thread;
         let temp_dir = tempdir().unwrap();
