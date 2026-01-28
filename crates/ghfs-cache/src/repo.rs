@@ -5,7 +5,7 @@
 //! and symlink swapping.
 
 use crate::git::{open_repository, resolve_default_branch};
-use crate::{atomic_symlink_swap, is_stale, CachePaths, GitCli, RepoLock};
+use crate::{CachePaths, GitCli, RepoLock, atomic_symlink_swap, is_stale};
 use ghfs_types::{GenerationId, RepoKey};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -97,7 +97,7 @@ impl RepoCache {
         let _lock = match RepoLock::acquire(&lock_path) {
             Ok(lock) => lock,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(CacheError::LockFailed)
+                return Err(CacheError::LockFailed);
             }
             Err(e) => return Err(CacheError::Io(e)),
         };
@@ -135,7 +135,7 @@ impl RepoCache {
         let _lock = match RepoLock::acquire(&lock_path) {
             Ok(lock) => lock,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(CacheError::LockFailed)
+                return Err(CacheError::LockFailed);
             }
             Err(e) => return Err(CacheError::Io(e)),
         };

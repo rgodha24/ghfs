@@ -10,38 +10,40 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        overlays = [ (import rust-overlay) ];
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    rust-overlay,
+  }:
+    flake-utils.lib.eachDefaultSystem (
+      system: let
+        overlays = [(import rust-overlay)];
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        
+
         rust = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" ];
+          extensions = ["rust-src" "rust-analyzer"];
         };
-        
+
         # FUSE is only available via nix on Linux
         fuseDeps = pkgs.lib.optionals pkgs.stdenv.isLinux [
           pkgs.fuse3
         ];
-      in
-      {
+      in {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "ghfs";
           version = "0.1.0";
-          
+
           src = ./.;
-          
+
           cargoLock.lockFile = ./Cargo.lock;
-          
-          nativeBuildInputs = [
-            pkgs.pkg-config
-          ];
-          
+
+          nativeBuildInputs = [pkgs.pkg-config];
+
           buildInputs = fuseDeps;
-          
+
           # Skip tests that require network
           checkFlags = [
             "--skip=clone_bare_shallow"
@@ -51,7 +53,7 @@
             "--skip=ensure_current"
             "--skip=concurrent"
           ];
-          
+
           meta = with pkgs.lib; {
             description = "Mount GitHub repositories as a local filesystem";
             homepage = "https://github.com/rgodha24/ghfs";
@@ -62,13 +64,15 @@
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = [
-            rust
-            pkgs.pkg-config
-            pkgs.git
-            pkgs.cargo-watch
-            pkgs.cargo-nextest
-          ] ++ fuseDeps;
+          buildInputs =
+            [
+              rust
+              pkgs.pkg-config
+              pkgs.git
+              pkgs.cargo-watch
+              pkgs.cargo-nextest
+            ]
+            ++ fuseDeps;
 
           shellHook = ''
             echo "ghfs dev shell"

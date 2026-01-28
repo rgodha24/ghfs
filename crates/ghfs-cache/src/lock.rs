@@ -165,7 +165,7 @@ mod tests {
         // Thread 2: Wait for thread 1 to acquire lock, then try to acquire
         let handle2 = thread::spawn(move || {
             barrier.wait(); // Wait for thread 1 to acquire lock
-                            // Thread 1 holds the lock, try_acquire should return None
+            // Thread 1 holds the lock, try_acquire should return None
             let result = RepoLock::try_acquire(&lock_path).unwrap();
             assert!(
                 result.is_none(),
@@ -227,7 +227,7 @@ mod tests {
         // Thread 2: Wait for thread 1 to acquire lock, then try to acquire with timeout
         let handle2 = thread::spawn(move || {
             barrier.wait(); // Wait for thread 1 to acquire lock
-                            // Use a longer timeout; should succeed after thread 1 releases
+            // Use a longer timeout; should succeed after thread 1 releases
             let result = RepoLock::acquire_with_timeout(&lock_path, Duration::from_secs(2));
             assert!(
                 result.is_ok(),

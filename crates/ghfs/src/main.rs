@@ -67,7 +67,9 @@ fn main() {
             if !fuse_available {
                 eprintln!("Error: FUSE is not available on this system.");
                 #[cfg(target_os = "linux")]
-                eprintln!("Please install FUSE: sudo apt install fuse3 (Debian/Ubuntu) or sudo dnf install fuse3 (Fedora)");
+                eprintln!(
+                    "Please install FUSE: sudo apt install fuse3 (Debian/Ubuntu) or sudo dnf install fuse3 (Fedora)"
+                );
                 #[cfg(target_os = "macos")]
                 eprintln!("Please install macFUSE: https://osxfuse.github.io/");
                 std::process::exit(1);
@@ -77,7 +79,9 @@ fn main() {
             let fs = GhFs::with_default_cache();
             if let Err(e) = fs.mount(&mountpoint) {
                 eprintln!("Mount failed: {}", e);
-                eprintln!("Hint: Make sure the mountpoint is not already in use and you have necessary permissions.");
+                eprintln!(
+                    "Hint: Make sure the mountpoint is not already in use and you have necessary permissions."
+                );
                 std::process::exit(1);
             }
         }
