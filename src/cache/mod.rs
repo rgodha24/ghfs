@@ -2,6 +2,7 @@
 
 mod git;
 mod lock;
+mod managed;
 mod paths;
 mod repo;
 mod staleness;
@@ -12,6 +13,7 @@ pub use git::{
     resolve_default_branch, GitCli, GitError,
 };
 pub use lock::RepoLock;
+pub use managed::ManagedCache;
 pub use paths::CachePaths;
 pub use repo::{CacheError, GenerationRef, RepoCache};
 pub use staleness::{is_stale, touch_symlink};

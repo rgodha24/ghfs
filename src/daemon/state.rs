@@ -2,6 +2,7 @@
 
 use rusqlite::{params, Connection};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::types::RepoKey;
 
@@ -21,7 +22,7 @@ fn i64_to_u64_opt(val: Option<i64>) -> Option<u64> {
 
 /// Manages persistent state for the GHFS daemon.
 pub struct State {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 /// Represents the state of a repository in the database.
@@ -41,12 +42,15 @@ impl State {
     /// Open or create the state database at the given path.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Initialize the database schema. This is idempotent.
     pub fn init(&self) -> Result<(), rusqlite::Error> {
-        self.conn.execute_batch(
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS repos (
                 id INTEGER PRIMARY KEY,
@@ -73,15 +77,16 @@ impl State {
     pub fn get_or_create_repo(&self, key: &RepoKey) -> Result<RepoState, rusqlite::Error> {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
+        let conn = self.conn.lock().unwrap();
 
         // Insert if not exists
-        self.conn.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO repos (owner, repo) VALUES (?1, ?2)",
             params![owner, repo],
         )?;
 
         // Select the record
-        self.conn.query_row(
+        conn.query_row(
             "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
              FROM repos WHERE owner = ?1 AND repo = ?2",
             params![owner, repo],
@@ -112,8 +117,9 @@ impl State {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
         let now = now_unix();
+        let conn = self.conn.lock().unwrap();
 
-        self.conn.execute(
+        conn.execute(
             "UPDATE repos SET current_generation = ?1, head_commit = ?2, last_sync_at = ?3
              WHERE owner = ?4 AND repo = ?5",
             params![generation as i64, commit, now, owner, repo],
@@ -126,8 +132,9 @@ impl State {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
         let now = now_unix();
+        let conn = self.conn.lock().unwrap();
 
-        self.conn.execute(
+        conn.execute(
             "UPDATE repos SET last_access_at = ?1 WHERE owner = ?2 AND repo = ?3",
             params![now, owner, repo],
         )?;
@@ -138,8 +145,9 @@ impl State {
     pub fn set_priority(&self, key: &RepoKey, priority: i32) -> Result<(), rusqlite::Error> {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
+        let conn = self.conn.lock().unwrap();
 
-        self.conn.execute(
+        conn.execute(
             "UPDATE repos SET priority = ?1 WHERE owner = ?2 AND repo = ?3",
             params![priority, owner, repo],
         )?;
@@ -152,8 +160,9 @@ impl State {
     /// `now - max_age_secs`.
     pub fn get_stale_repos(&self, max_age_secs: i64) -> Result<Vec<RepoState>, rusqlite::Error> {
         let threshold = now_unix() - max_age_secs;
+        let conn = self.conn.lock().unwrap();
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
              FROM repos
              WHERE last_sync_at IS NULL OR last_sync_at < ?1
@@ -178,7 +187,9 @@ impl State {
 
     /// Get all repos ordered by priority (descending) then staleness.
     pub fn list_repos(&self) -> Result<Vec<RepoState>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
             "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
              FROM repos
              ORDER BY priority DESC, COALESCE(last_sync_at, 0)",
@@ -204,8 +215,9 @@ impl State {
     pub fn delete_repo(&self, key: &RepoKey) -> Result<(), rusqlite::Error> {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
+        let conn = self.conn.lock().unwrap();
 
-        self.conn.execute(
+        conn.execute(
             "DELETE FROM repos WHERE owner = ?1 AND repo = ?2",
             params![owner, repo],
         )?;
@@ -298,6 +310,8 @@ mod tests {
         let two_hours_ago = now_unix() - 7200;
         state
             .conn
+            .lock()
+            .unwrap()
             .execute(
                 "UPDATE repos SET last_sync_at = ?1 WHERE owner = 'org2' AND repo = 'repo2'",
                 params![two_hours_ago],
