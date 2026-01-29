@@ -123,14 +123,12 @@ impl RepoCache {
     pub fn ensure_current(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
         let current_link = self.paths.current_symlink(key);
 
-        // Fast path: if exists and not stale, return immediately (no lock needed)
         if current_link.exists() && !is_stale(&current_link, self.max_age) {
             if let Ok(current) = self.read_current_ref(key) {
                 return Ok(current);
             }
         }
 
-        // Slow path: need to materialize or refresh
         let lock_path = self.paths.lock_path(key);
         let _lock = match RepoLock::acquire(&lock_path) {
             Ok(lock) => lock,
@@ -140,7 +138,6 @@ impl RepoCache {
             Err(e) => return Err(CacheError::Io(e)),
         };
 
-        // Re-check under lock (another process may have updated)
         if current_link.exists() && !is_stale(&current_link, self.max_age) {
             if let Ok(current) = self.read_current_ref(key) {
                 return Ok(current);
@@ -150,10 +147,8 @@ impl RepoCache {
         let mirror_path = self.paths.mirror_dir(key);
 
         let refresh_result = if !mirror_path.exists() {
-            // First time: clone + create initial worktree
             self.initial_clone(key)
         } else {
-            // Refresh: fetch + create new worktree
             self.refresh(key)
         };
 
@@ -172,7 +167,6 @@ impl RepoCache {
     fn initial_clone(&self, key: &RepoKey) -> Result<(), CacheError> {
         let mirror_path = self.paths.mirror_dir(key);
 
-        // Clone bare shallow
         if let Err(err) =
             self.git
                 .clone_bare_shallow(key.owner.as_str(), key.repo.as_str(), &mirror_path)
@@ -181,11 +175,9 @@ impl RepoCache {
             return Err(err.into());
         }
 
-        // Get HEAD commit
         let repo = open_repository(&mirror_path)?;
         let (_branch, commit) = resolve_default_branch(&repo)?;
 
-        // Create first generation worktree
         let generation = self.next_generation(key);
         let gen_path = self.paths.generation_dir(key, generation);
         if let Err(err) = self.git.create_worktree(&mirror_path, &gen_path, &commit) {
@@ -193,7 +185,6 @@ impl RepoCache {
             return Err(err.into());
         }
 
-        // Set current symlink
         let current_link = self.paths.current_symlink(key);
         if let Err(err) = atomic_symlink_swap(&current_link, &gen_path) {
             cleanup_worktree(&gen_path);
@@ -208,24 +199,19 @@ impl RepoCache {
         let repo = open_repository(&mirror_path)?;
         let (branch, _old_commit) = resolve_default_branch(&repo)?;
 
-        // Fetch latest
         self.git.fetch_shallow(&mirror_path, &branch)?;
 
-        // Re-read commit after fetch
         let repo = open_repository(&mirror_path)?;
         let (_branch, commit) = resolve_default_branch(&repo)?;
 
-        // Determine next generation number
         let next_gen = self.next_generation(key);
         let gen_path = self.paths.generation_dir(key, next_gen);
 
-        // Create new worktree
         if let Err(err) = self.git.create_worktree(&mirror_path, &gen_path, &commit) {
             cleanup_worktree(&gen_path);
             return Err(err.into());
         }
 
-        // Swap current
         let current_link = self.paths.current_symlink(key);
         if let Err(err) = atomic_symlink_swap(&current_link, &gen_path) {
             cleanup_worktree(&gen_path);

@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 
 pub mod cache;
+pub mod daemon;
 pub mod fs;
+pub mod protocol;
 pub mod types;
 
-use clap::{Parser, Subcommand};
 use crate::fs::GhFs;
 use crate::types::RepoKey;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(

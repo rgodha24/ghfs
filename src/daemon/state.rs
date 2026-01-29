@@ -1,0 +1,342 @@
+//! SQLite-based state persistence for tracking repos, sync state, and priorities.
+
+use rusqlite::{params, Connection};
+use std::path::Path;
+
+use crate::types::RepoKey;
+
+/// Returns the current Unix timestamp in seconds.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Convert Option<i64> to Option<u64> for generation IDs.
+/// SQLite stores integers as i64, but generation IDs are u64.
+fn i64_to_u64_opt(val: Option<i64>) -> Option<u64> {
+    val.map(|v| v as u64)
+}
+
+/// Manages persistent state for the GHFS daemon.
+pub struct State {
+    conn: Connection,
+}
+
+/// Represents the state of a repository in the database.
+#[derive(Debug, Clone)]
+pub struct RepoState {
+    pub id: i64,
+    pub owner: String,
+    pub repo: String,
+    pub priority: i32,
+    pub current_generation: Option<u64>,
+    pub head_commit: Option<String>,
+    pub last_access_at: Option<i64>,
+    pub last_sync_at: Option<i64>,
+}
+
+impl State {
+    /// Open or create the state database at the given path.
+    pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
+        let conn = Connection::open(path)?;
+        Ok(Self { conn })
+    }
+
+    /// Initialize the database schema. This is idempotent.
+    pub fn init(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS repos (
+                id INTEGER PRIMARY KEY,
+                owner TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                current_generation INTEGER,
+                head_commit TEXT,
+                last_access_at INTEGER,
+                last_sync_at INTEGER,
+                UNIQUE(owner, repo)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_repos_sync ON repos(last_sync_at);
+            CREATE INDEX IF NOT EXISTS idx_repos_priority ON repos(priority DESC, last_sync_at);
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// Get or create a repo record, returning the repo state.
+    ///
+    /// Uses INSERT OR IGNORE followed by SELECT to ensure idempotency.
+    pub fn get_or_create_repo(&self, key: &RepoKey) -> Result<RepoState, rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+
+        // Insert if not exists
+        self.conn.execute(
+            "INSERT OR IGNORE INTO repos (owner, repo) VALUES (?1, ?2)",
+            params![owner, repo],
+        )?;
+
+        // Select the record
+        self.conn.query_row(
+            "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
+             FROM repos WHERE owner = ?1 AND repo = ?2",
+            params![owner, repo],
+            |row| {
+                Ok(RepoState {
+                    id: row.get(0)?,
+                    owner: row.get(1)?,
+                    repo: row.get(2)?,
+                    priority: row.get(3)?,
+                    current_generation: i64_to_u64_opt(row.get(4)?),
+                    head_commit: row.get(5)?,
+                    last_access_at: row.get(6)?,
+                    last_sync_at: row.get(7)?,
+                })
+            },
+        )
+    }
+
+    /// Update repo after a successful sync.
+    ///
+    /// Sets the generation, head commit, and last_sync_at timestamp.
+    pub fn update_sync(
+        &self,
+        key: &RepoKey,
+        generation: u64,
+        commit: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+        let now = now_unix();
+
+        self.conn.execute(
+            "UPDATE repos SET current_generation = ?1, head_commit = ?2, last_sync_at = ?3
+             WHERE owner = ?4 AND repo = ?5",
+            params![generation as i64, commit, now, owner, repo],
+        )?;
+        Ok(())
+    }
+
+    /// Record an access time for GC decisions.
+    pub fn touch_access(&self, key: &RepoKey) -> Result<(), rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+        let now = now_unix();
+
+        self.conn.execute(
+            "UPDATE repos SET last_access_at = ?1 WHERE owner = ?2 AND repo = ?3",
+            params![now, owner, repo],
+        )?;
+        Ok(())
+    }
+
+    /// Set priority for a repo. 0 = normal, higher = more important.
+    pub fn set_priority(&self, key: &RepoKey, priority: i32) -> Result<(), rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+
+        self.conn.execute(
+            "UPDATE repos SET priority = ?1 WHERE owner = ?2 AND repo = ?3",
+            params![priority, owner, repo],
+        )?;
+        Ok(())
+    }
+
+    /// Get repos that are stale (last_sync_at older than threshold).
+    ///
+    /// A repo is considered stale if its last_sync_at is NULL or older than
+    /// `now - max_age_secs`.
+    pub fn get_stale_repos(&self, max_age_secs: i64) -> Result<Vec<RepoState>, rusqlite::Error> {
+        let threshold = now_unix() - max_age_secs;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
+             FROM repos
+             WHERE last_sync_at IS NULL OR last_sync_at < ?1
+             ORDER BY priority DESC, COALESCE(last_sync_at, 0)",
+        )?;
+
+        let rows = stmt.query_map(params![threshold], |row| {
+            Ok(RepoState {
+                id: row.get(0)?,
+                owner: row.get(1)?,
+                repo: row.get(2)?,
+                priority: row.get(3)?,
+                current_generation: i64_to_u64_opt(row.get(4)?),
+                head_commit: row.get(5)?,
+                last_access_at: row.get(6)?,
+                last_sync_at: row.get(7)?,
+            })
+        })?;
+
+        rows.collect()
+    }
+
+    /// Get all repos ordered by priority (descending) then staleness.
+    pub fn list_repos(&self) -> Result<Vec<RepoState>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
+             FROM repos
+             ORDER BY priority DESC, COALESCE(last_sync_at, 0)",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(RepoState {
+                id: row.get(0)?,
+                owner: row.get(1)?,
+                repo: row.get(2)?,
+                priority: row.get(3)?,
+                current_generation: i64_to_u64_opt(row.get(4)?),
+                head_commit: row.get(5)?,
+                last_access_at: row.get(6)?,
+                last_sync_at: row.get(7)?,
+            })
+        })?;
+
+        rows.collect()
+    }
+
+    /// Delete a repo record.
+    pub fn delete_repo(&self, key: &RepoKey) -> Result<(), rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+
+        self.conn.execute(
+            "DELETE FROM repos WHERE owner = ?1 AND repo = ?2",
+            params![owner, repo],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn create_test_state() -> (State, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let state = State::open(&db_path).unwrap();
+        state.init().unwrap();
+        (state, dir)
+    }
+
+    fn make_repo_key(owner: &str, repo: &str) -> RepoKey {
+        RepoKey {
+            owner: owner.parse().unwrap(),
+            repo: repo.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_create_and_get_repo() {
+        let (state, _dir) = create_test_state();
+        let key = make_repo_key("octocat", "hello-world");
+
+        // First call creates the record
+        let repo1 = state.get_or_create_repo(&key).unwrap();
+        assert_eq!(repo1.owner, "octocat");
+        assert_eq!(repo1.repo, "hello-world");
+        assert_eq!(repo1.priority, 0);
+        assert!(repo1.current_generation.is_none());
+        assert!(repo1.head_commit.is_none());
+        assert!(repo1.last_access_at.is_none());
+        assert!(repo1.last_sync_at.is_none());
+
+        // Second call returns the same record (idempotent)
+        let repo2 = state.get_or_create_repo(&key).unwrap();
+        assert_eq!(repo1.id, repo2.id);
+        assert_eq!(repo1.owner, repo2.owner);
+        assert_eq!(repo1.repo, repo2.repo);
+    }
+
+    #[test]
+    fn test_update_sync() {
+        let (state, _dir) = create_test_state();
+        let key = make_repo_key("rust-lang", "rust");
+
+        // Create the repo first
+        state.get_or_create_repo(&key).unwrap();
+
+        // Update sync info
+        let generation = 42u64;
+        let commit = "abc123def456";
+        state.update_sync(&key, generation, commit).unwrap();
+
+        // Verify the update
+        let repo = state.get_or_create_repo(&key).unwrap();
+        assert_eq!(repo.current_generation, Some(42));
+        assert_eq!(repo.head_commit, Some("abc123def456".to_string()));
+        assert!(repo.last_sync_at.is_some());
+
+        // Verify timestamp is recent (within last 5 seconds)
+        let now = now_unix();
+        let sync_time = repo.last_sync_at.unwrap();
+        assert!(now - sync_time < 5);
+    }
+
+    #[test]
+    fn test_get_stale_repos() {
+        let (state, _dir) = create_test_state();
+
+        // Create two repos
+        let key1 = make_repo_key("org1", "repo1");
+        let key2 = make_repo_key("org2", "repo2");
+
+        state.get_or_create_repo(&key1).unwrap();
+        state.get_or_create_repo(&key2).unwrap();
+
+        // Sync repo1 now
+        state.update_sync(&key1, 1, "commit1").unwrap();
+
+        // Manually set repo2's last_sync_at to 2 hours ago
+        let two_hours_ago = now_unix() - 7200;
+        state
+            .conn
+            .execute(
+                "UPDATE repos SET last_sync_at = ?1 WHERE owner = 'org2' AND repo = 'repo2'",
+                params![two_hours_ago],
+            )
+            .unwrap();
+
+        // Get repos stale for more than 1 hour (3600 seconds)
+        let stale = state.get_stale_repos(3600).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].owner, "org2");
+        assert_eq!(stale[0].repo, "repo2");
+
+        // Create a third repo with no sync time (NULL) - should also be stale
+        let key3 = make_repo_key("org3", "repo3");
+        state.get_or_create_repo(&key3).unwrap();
+
+        let stale = state.get_stale_repos(3600).unwrap();
+        assert_eq!(stale.len(), 2);
+    }
+
+    #[test]
+    fn test_priority() {
+        let (state, _dir) = create_test_state();
+        let key = make_repo_key("priority", "test");
+
+        // Create repo with default priority
+        let repo = state.get_or_create_repo(&key).unwrap();
+        assert_eq!(repo.priority, 0);
+
+        // Set high priority
+        state.set_priority(&key, 10).unwrap();
+
+        let repo = state.get_or_create_repo(&key).unwrap();
+        assert_eq!(repo.priority, 10);
+
+        // Set negative priority
+        state.set_priority(&key, -5).unwrap();
+
+        let repo = state.get_or_create_repo(&key).unwrap();
+        assert_eq!(repo.priority, -5);
+    }
+}

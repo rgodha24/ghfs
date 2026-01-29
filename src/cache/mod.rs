@@ -8,8 +8,8 @@ mod staleness;
 mod swap;
 
 pub use git::{
-    GitCli, GitError, clone_bare_shallow, create_worktree, fetch_shallow, open_repository,
-    repository_exists, resolve_default_branch,
+    clone_bare_shallow, create_worktree, fetch_shallow, open_repository, repository_exists,
+    resolve_default_branch, GitCli, GitError,
 };
 pub use lock::RepoLock;
 pub use paths::CachePaths;

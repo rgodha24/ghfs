@@ -170,7 +170,7 @@ impl GitCli {
             std::fs::create_dir_all(parent)?;
         }
 
-        let url = format!("https://github.com/{}/{}.git", owner, repo);
+        let url = format!("https://github.com/{owner}/{repo}.git");
         let dest_str = dest.to_str().ok_or_else(|| {
             GitError::ParseError("destination path is not valid UTF-8".to_string())
         })?;
@@ -281,10 +281,7 @@ pub fn open_repository(path: &Path) -> Result<Repository, GitError> {
 ///
 /// Returns (branch_name, commit_sha) e.g. ("main", "abc123...")
 pub fn resolve_default_branch(repo: &Repository) -> Result<(String, String), GitError> {
-    // Get HEAD reference
     let head = repo.head()?;
-
-    // Get the branch name from the reference (strip "refs/heads/" prefix)
     let ref_name = head
         .name()
         .ok_or_else(|| GitError::ParseError("HEAD reference has no name".to_string()))?;
@@ -299,7 +296,6 @@ pub fn resolve_default_branch(repo: &Repository) -> Result<(String, String), Git
         })?
         .to_string();
 
-    // Get the commit SHA via peel_to_commit
     let commit = head.peel_to_commit()?;
     let commit_sha = commit.id().to_string();
 
