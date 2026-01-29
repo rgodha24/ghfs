@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub mod cache;
+pub mod cli;
 pub mod daemon;
 pub mod fs;
 pub mod protocol;
