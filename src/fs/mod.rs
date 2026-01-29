@@ -1,6 +1,7 @@
 //! GHFS FUSE filesystem implementation.
 
-use crate::cache::{CachePaths, RepoCache};
+use crate::cache::CachePaths;
+use crate::daemon::WorkerHandle;
 use crate::types::{GenerationId, Owner, Repo, RepoKey};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -63,7 +64,10 @@ fn underlying_key_from_metadata(
 
 /// The GHFS filesystem.
 pub struct GhFs {
-    cache: Arc<RepoCache>,
+    /// Worker handle for materialization requests
+    worker: Arc<WorkerHandle>,
+    /// Cache paths for direct file access after materialization
+    cache_paths: CachePaths,
     /// Inode table for managing passthrough inodes
     inodes: InodeTable,
     /// Cached UID for file attributes
@@ -83,8 +87,8 @@ pub struct GhFs {
 }
 
 impl GhFs {
-    /// Create a new filesystem instance backed by the provided cache.
-    pub fn new(cache: Arc<RepoCache>) -> Self {
+    /// Create a new filesystem instance with worker and cache paths.
+    pub fn new(worker: Arc<WorkerHandle>, cache_paths: CachePaths) -> Self {
         // Cache uid/gid at startup to avoid repeated unsafe calls
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
 
@@ -93,7 +97,8 @@ impl GhFs {
         virtual_nodes.insert(ROOT_INO, VirtualNode::Root);
 
         Self {
-            cache,
+            worker,
+            cache_paths,
             inodes: InodeTable::new(),
             uid,
             gid,
@@ -103,13 +108,6 @@ impl GhFs {
             virtual_names: DashMap::new(),
             next_virtual_ino: AtomicU64::new(VIRTUAL_INO_START), // Start at 2
         }
-    }
-
-    /// Create a filesystem instance using the default cache location.
-    pub fn with_default_cache() -> Self {
-        let paths = CachePaths::default();
-        let cache = Arc::new(RepoCache::new(paths));
-        Self::new(cache)
     }
 
     /// Allocate a new virtual inode
@@ -163,14 +161,42 @@ impl GhFs {
 
     /// Ensure a repo is materialized and return its generation path and ID.
     /// Called when traversing INTO a repo (lookup child or readdir).
+    /// This may block waiting for the worker to complete materialization.
     fn ensure_repo_materialized(&self, owner: &str, repo: &str) -> Option<(PathBuf, GenerationId)> {
         let key_str = format!("{}/{}", owner, repo);
         let key: RepoKey = match key_str.parse() {
             Ok(k) => k,
             Err(_) => return None,
         };
-        match self.cache.ensure_current(&key) {
-            Ok(g) => Some((g.path.clone(), g.generation)),
+
+        // First, try the fast path: check if current symlink exists
+        let current_link = self.cache_paths.current_symlink(&key);
+        if current_link.exists() {
+            if let Ok(target) = std::fs::read_link(&current_link) {
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    current_link.parent().unwrap().join(&target)
+                };
+
+                if target.exists() {
+                    // Parse generation from path
+                    if let Some(name) = target.file_name().and_then(|s| s.to_str()) {
+                        if let Some(num_str) = name.strip_prefix("gen-") {
+                            if let Ok(num) = num_str.parse::<u64>() {
+                                // Trigger background refresh (non-blocking)
+                                self.worker.refresh(key);
+                                return Some((target, GenerationId::new(num)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Slow path: ask worker to materialize (blocks)
+        match self.worker.materialize(key) {
+            Ok(gen_ref) => Some((gen_ref.path, gen_ref.generation)),
             Err(e) => {
                 log::error!("Failed to materialize repo {}/{}: {}", owner, repo, e);
                 None
@@ -180,7 +206,7 @@ impl GhFs {
 
     /// List cached owners by scanning the worktrees directory
     fn list_cached_owners(&self) -> Vec<String> {
-        let worktrees_dir = self.cache.paths().worktrees_dir();
+        let worktrees_dir = self.cache_paths.worktrees_dir();
         let mut owners = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
@@ -200,7 +226,7 @@ impl GhFs {
 
     /// List cached repos for an owner by scanning their worktrees directory
     fn list_cached_repos(&self, owner: &str) -> Vec<String> {
-        let owner_dir = self.cache.paths().worktrees_dir().join(owner);
+        let owner_dir = self.cache_paths.worktrees_dir().join(owner);
         let mut repos = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&owner_dir) {
@@ -239,12 +265,6 @@ impl GhFs {
 
         fuser::mount2(self, mountpoint, &options)?;
         Ok(())
-    }
-}
-
-impl Default for GhFs {
-    fn default() -> Self {
-        Self::with_default_cache()
     }
 }
 

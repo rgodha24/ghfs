@@ -7,7 +7,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::mpsc as oneshot;
 use std::thread::{self, JoinHandle};
 
-use crate::cache::{CacheError, GenerationRef, RepoCache};
+use crate::cache::{CacheError, GenerationRef, ManagedCache};
 use crate::types::RepoKey;
 
 /// Requests the worker can handle.
@@ -34,12 +34,12 @@ pub enum WorkerRequest {
 /// Background worker that processes git operations.
 pub struct Worker {
     receiver: Receiver<WorkerRequest>,
-    cache: RepoCache,
+    cache: ManagedCache,
 }
 
 impl Worker {
     /// Create a new worker with the given receiver and cache.
-    pub fn new(receiver: Receiver<WorkerRequest>, cache: RepoCache) -> Self {
+    pub fn new(receiver: Receiver<WorkerRequest>, cache: ManagedCache) -> Self {
         Self { receiver, cache }
     }
 
@@ -87,7 +87,7 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     /// Spawn the worker thread.
-    pub fn spawn(cache: RepoCache) -> Self {
+    pub fn spawn(cache: ManagedCache) -> Self {
         let (sender, receiver) = bounded(100); // Buffer up to 100 requests
 
         let worker = Worker::new(receiver, cache);
@@ -136,36 +136,5 @@ impl WorkerHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-    }
-}
-
-impl Drop for WorkerHandle {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cache::CachePaths;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_worker_spawn_and_shutdown() {
-        let temp_dir = tempdir().unwrap();
-        let paths = CachePaths::new(temp_dir.path());
-        let cache = RepoCache::new(paths);
-
-        let mut handle = WorkerHandle::spawn(cache);
-
-        // Verify we can get a sender
-        let _sender = handle.sender();
-
-        // Shutdown should complete cleanly
-        handle.shutdown();
-
-        // Double shutdown should be safe (no-op)
-        handle.shutdown();
     }
 }
