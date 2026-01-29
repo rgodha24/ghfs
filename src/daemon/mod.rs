@@ -167,9 +167,12 @@ pub fn start() -> Result<(), DaemonError> {
         return Err(DaemonError::AlreadyRunning);
     }
 
+    // Create daemon first, then write PID file on success
+    let daemon = Daemon::new()?;
+
     write_pid_file()?;
 
-    let result = Daemon::new()?.run();
+    let result = daemon.run();
 
     remove_pid_file();
 

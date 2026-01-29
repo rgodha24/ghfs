@@ -121,6 +121,24 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
 
         Request::Stop => {
             ctx.shutdown.store(true, Ordering::SeqCst);
+
+            // Trigger unmount to unblock the FUSE event loop
+            let mount_point = ctx.mount_point.clone();
+            std::thread::spawn(move || {
+                // Small delay to allow response to be sent
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("fusermount")
+                    .args(["-u", &mount_point])
+                    .status();
+
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("umount")
+                    .arg(&mount_point)
+                    .status();
+            });
+
             Ok(Response::Ok(()))
         }
     }
