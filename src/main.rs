@@ -7,7 +7,7 @@ pub mod types;
 
 use clap::{Parser, Subcommand};
 
-use crate::cli::Client;
+use crate::cli::{Client, ClientError};
 use crate::types::RepoKey;
 
 #[derive(Parser)]
@@ -74,7 +74,7 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
-        if e.to_string().contains("not running") {
+        if let Some(ClientError::NotRunning) = e.downcast_ref::<ClientError>() {
             eprintln!();
             eprintln!("Hint: Start the daemon with: ghfs daemon");
         }

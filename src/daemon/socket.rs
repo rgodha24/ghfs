@@ -35,7 +35,6 @@ pub struct Context {
     pub worker: Arc<WorkerHandle>,
     pub start_time: Instant,
     pub mount_point: String,
-    pub shutdown: Arc<AtomicBool>,
 }
 
 /// Handle a single JSON-RPC request.
@@ -120,25 +119,8 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
         }
 
         Request::Stop => {
-            ctx.shutdown.store(true, Ordering::SeqCst);
-
-            // Trigger unmount to unblock the FUSE event loop
-            let mount_point = ctx.mount_point.clone();
-            std::thread::spawn(move || {
-                // Small delay to allow response to be sent
-                std::thread::sleep(std::time::Duration::from_millis(100));
-
-                #[cfg(target_os = "linux")]
-                let _ = std::process::Command::new("fusermount")
-                    .args(["-u", &mount_point])
-                    .status();
-
-                #[cfg(target_os = "macos")]
-                let _ = std::process::Command::new("umount")
-                    .arg(&mount_point)
-                    .status();
-            });
-
+            // Trigger unmount to unblock the FUSE event loop.
+            super::spawn_unmount(ctx.mount_point.clone());
             Ok(Response::Ok(()))
         }
     }
@@ -152,6 +134,9 @@ fn format_timestamp(ts: i64) -> String {
         .as_secs() as i64;
 
     let diff = now - ts;
+    if diff < 0 {
+        return format!("in {}s", -diff);
+    }
     if diff < 60 {
         format!("{}s ago", diff)
     } else if diff < 3600 {
@@ -228,7 +213,6 @@ impl SocketServerHandle {
             worker,
             start_time: Instant::now(),
             mount_point,
-            shutdown: shutdown.clone(),
         });
 
         let shutdown_clone = shutdown.clone();

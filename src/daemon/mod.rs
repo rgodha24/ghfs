@@ -11,7 +11,7 @@ pub use state::{RepoState, State};
 pub use worker::{WorkerHandle, WorkerRequest};
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -44,6 +44,35 @@ pub struct Daemon {
     mount_point: PathBuf,
     state: Arc<State>,
     shutdown: Arc<AtomicBool>,
+}
+
+/// Spawn a detached thread to unmount the FUSE filesystem.
+pub(crate) fn spawn_unmount(mount_point: String) {
+    std::thread::spawn(move || {
+        // Small delay to allow any response to be sent first.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        #[cfg(target_os = "linux")]
+        let status = std::process::Command::new("fusermount")
+            .args(["-u", &mount_point])
+            .status();
+
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("umount")
+            .arg(&mount_point)
+            .status();
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let status: Result<std::process::ExitStatus, std::io::Error> = Err(
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "Unsupported platform"),
+        );
+
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => log::warn!("Unmount command failed with exit code: {:?}", s.code()),
+            Err(e) => log::warn!("Failed to run unmount command: {}", e),
+        }
+    });
 }
 
 impl Daemon {
@@ -107,10 +136,10 @@ impl Daemon {
         log::info!("Scheduler started");
 
         // Setup signal handler for graceful shutdown
-        let shutdown = Arc::clone(&self.shutdown);
+        let mount_point = self.mount_point.to_string_lossy().to_string();
         ctrlc::set_handler(move || {
             log::info!("Received shutdown signal");
-            shutdown.store(true, Ordering::SeqCst);
+            spawn_unmount(mount_point.clone());
         })
         .expect("failed to set signal handler");
 
