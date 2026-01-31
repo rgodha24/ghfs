@@ -30,25 +30,32 @@ impl ManagedCache {
     }
 
     /// Ensure a repo is materialized and current.
-    /// Updates access time in state. Updates sync state on success.
+    /// Updates access time in state. Updates sync state on refresh.
     pub fn ensure_current(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
         let _ = self.state.get_or_create_repo(key);
         // Record access
         let _ = self.state.touch_access(key);
 
-        let result = self.cache.ensure_current(key)?;
+        let result = self.cache.ensure_current_with_status(key)?;
 
         // Update state with new generation info
-        let _ = self
-            .state
-            .update_sync(key, result.generation.as_u64(), &result.commit);
-        let _ = self
-            .state
-            .upsert_generation(key, result.generation.as_u64(), &result.commit, dir_size(&result.path));
+        if result.refreshed {
+            let _ = self.state.update_sync(
+                key,
+                result.gen_ref.generation.as_u64(),
+                &result.gen_ref.commit,
+            );
+        }
+        let _ = self.state.upsert_generation(
+            key,
+            result.gen_ref.generation.as_u64(),
+            &result.gen_ref.commit,
+            dir_size(&result.gen_ref.path),
+        );
         let mirror_size = dir_size(self.cache.paths().mirror_dir(key));
         let _ = self.state.update_mirror_size(key, mirror_size);
 
-        Ok(result)
+        Ok(result.gen_ref)
     }
 
     /// Force refresh a repo, ignoring staleness.
@@ -64,9 +71,12 @@ impl ManagedCache {
         let _ = self
             .state
             .update_sync(key, result.generation.as_u64(), &result.commit);
-        let _ = self
-            .state
-            .upsert_generation(key, result.generation.as_u64(), &result.commit, dir_size(&result.path));
+        let _ = self.state.upsert_generation(
+            key,
+            result.generation.as_u64(),
+            &result.commit,
+            dir_size(&result.path),
+        );
         let mirror_size = dir_size(self.cache.paths().mirror_dir(key));
         let _ = self.state.update_mirror_size(key, mirror_size);
 

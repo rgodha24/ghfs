@@ -47,7 +47,8 @@ pub struct RepoInfo {
     pub priority: i32,
     pub generation: Option<u64>,
     pub commit: Option<String>,
-    pub last_sync: Option<String>, // Human-readable timestamp
+    pub last_sync: Option<String>,   // Human-readable timestamp
+    pub last_access: Option<String>, // Human-readable timestamp
     #[serde(default)]
     pub generation_count: u64,
     #[serde(default)]

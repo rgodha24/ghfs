@@ -2,14 +2,16 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 use ratatui::{Frame, Terminal};
-use ratatui::backend::CrosstermBackend;
 
 use crate::cli::{Client, ClientError};
 use crate::protocol::ListResult;
@@ -39,16 +41,15 @@ pub fn run_status_tui() -> Result<(), Box<dyn std::error::Error>> {
     let result = run_loop(&mut terminal);
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = ViewState::default();
     let mut last_poll = Instant::now() - Duration::from_secs(2);
 
@@ -101,10 +102,7 @@ fn refresh_state() -> ViewState {
     };
 
     let rows = build_rows(list);
-    ViewState {
-        rows,
-        error: None,
-    }
+    ViewState { rows, error: None }
 }
 
 fn build_rows(list: ListResult) -> Vec<RepoRow> {
@@ -124,7 +122,6 @@ fn build_rows(list: ListResult) -> Vec<RepoRow> {
     rows
 }
 
-
 fn render(frame: &mut Frame, state: &ViewState) {
     let size = frame.area();
     let chunks = Layout::default()
@@ -132,12 +129,9 @@ fn render(frame: &mut Frame, state: &ViewState) {
         .split(size);
 
     if let Some(error) = &state.error {
-        let block = Block::default()
-            .title("ghfs status")
-            .borders(Borders::ALL);
+        let block = Block::default().title("ghfs status").borders(Borders::ALL);
         let row = Row::new(vec![Cell::from(Line::from(error.as_str()))]);
-        let table = Table::new(vec![row], [Constraint::Percentage(100)])
-            .block(block);
+        let table = Table::new(vec![row], [Constraint::Percentage(100)]).block(block);
         frame.render_widget(table, chunks[0]);
         return;
     }
@@ -149,7 +143,11 @@ fn render(frame: &mut Frame, state: &ViewState) {
         Cell::from("SIZE"),
         Cell::from("LAST SYNC"),
     ])
-    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows = state.rows.iter().map(|row| {
         Row::new(vec![
@@ -161,9 +159,7 @@ fn render(frame: &mut Frame, state: &ViewState) {
         ])
     });
 
-    let block = Block::default()
-        .title("ghfs status")
-        .borders(Borders::ALL);
+    let block = Block::default().title("ghfs status").borders(Borders::ALL);
     let table = Table::new(
         rows,
         [

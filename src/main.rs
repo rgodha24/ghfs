@@ -7,7 +7,7 @@ pub mod types;
 
 use clap::{Parser, Subcommand};
 
-use crate::cli::{run_status_tui, Client, ClientError};
+use crate::cli::{Client, ClientError, run_status_tui};
 use crate::types::RepoKey;
 
 #[derive(Parser)]
@@ -166,10 +166,10 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "{:<40} {:>8} {:>12} {:>15}",
-        "REPO", "PRIORITY", "GENERATION", "LAST SYNC"
+        "{:<40} {:>8} {:>12} {:>15} {:>15}",
+        "REPO", "PRIORITY", "GENERATION", "LAST SYNC", "LAST ACCESS"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(96));
 
     for repo in result.repos {
         let repo_name = format!("{}/{}", repo.owner, repo.repo);
@@ -183,10 +183,11 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
             .map(|g| g.to_string())
             .unwrap_or_else(|| "-".to_string());
         let last_sync = repo.last_sync.unwrap_or_else(|| "never".to_string());
+        let last_access = repo.last_access.unwrap_or_else(|| "never".to_string());
 
         println!(
-            "{:<40} {:>8} {:>12} {:>15}",
-            repo_name, priority, generation, last_sync
+            "{:<40} {:>8} {:>12} {:>15} {:>15}",
+            repo_name, priority, generation, last_sync, last_access
         );
     }
 

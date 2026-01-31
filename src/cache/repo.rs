@@ -42,6 +42,15 @@ pub struct GenerationRef {
     pub commit: String,
 }
 
+/// Result of ensuring a repo is current, with refresh status.
+#[derive(Debug, Clone)]
+pub(crate) struct EnsureCurrentResult {
+    /// The current generation reference.
+    pub gen_ref: GenerationRef,
+    /// Whether a refresh or clone was performed.
+    pub refreshed: bool,
+}
+
 /// Cache manager for GitHub repositories.
 pub struct RepoCache {
     paths: CachePaths,
@@ -121,11 +130,23 @@ impl RepoCache {
     /// 2. Refresh if stale
     /// 3. Return existing if fresh
     pub fn ensure_current(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
+        self.ensure_current_with_status(key)
+            .map(|result| result.gen_ref)
+    }
+
+    /// Ensure a repo is materialized and return its generation with refresh info.
+    pub(crate) fn ensure_current_with_status(
+        &self,
+        key: &RepoKey,
+    ) -> Result<EnsureCurrentResult, CacheError> {
         let current_link = self.paths.current_symlink(key);
 
         if current_link.exists() && !is_stale(&current_link, self.max_age) {
             if let Ok(current) = self.read_current_ref(key) {
-                return Ok(current);
+                return Ok(EnsureCurrentResult {
+                    gen_ref: current,
+                    refreshed: false,
+                });
             }
         }
 
@@ -140,7 +161,10 @@ impl RepoCache {
 
         if current_link.exists() && !is_stale(&current_link, self.max_age) {
             if let Ok(current) = self.read_current_ref(key) {
-                return Ok(current);
+                return Ok(EnsureCurrentResult {
+                    gen_ref: current,
+                    refreshed: false,
+                });
             }
         }
 
@@ -153,10 +177,19 @@ impl RepoCache {
         };
 
         match refresh_result {
-            Ok(()) => self.read_current_ref(key),
+            Ok(()) => {
+                let current = self.read_current_ref(key)?;
+                Ok(EnsureCurrentResult {
+                    gen_ref: current,
+                    refreshed: true,
+                })
+            }
             Err(err) => {
                 if let Ok(current) = self.read_current_ref(key) {
-                    Ok(current)
+                    Ok(EnsureCurrentResult {
+                        gen_ref: current,
+                        refreshed: false,
+                    })
                 } else {
                     Err(err)
                 }

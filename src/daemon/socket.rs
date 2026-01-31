@@ -112,6 +112,7 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
                     generation: r.current_generation,
                     commit: r.head_commit,
                     last_sync: r.last_sync_at.map(format_timestamp),
+                    last_access: r.last_access_at.map(format_timestamp),
                     generation_count: r.generation_count,
                     commit_count: r.commit_count,
                     total_size_bytes: r.total_size_bytes,
