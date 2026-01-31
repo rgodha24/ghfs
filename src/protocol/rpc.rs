@@ -191,6 +191,9 @@ mod tests {
                 mount_point: "/mnt/ghfs".to_string(),
                 repo_count: 10,
                 uptime_secs: 7200,
+                version: "0.1.0".to_string(),
+                pid: 1234,
+                pending_syncs: vec![],
             }),
             Value::from(5),
         );

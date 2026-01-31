@@ -30,6 +30,10 @@ pub struct StatusResult {
     pub mount_point: String,
     pub repo_count: usize,
     pub uptime_secs: u64,
+    pub version: String,
+    pub pid: u32,
+    #[serde(default)]
+    pub pending_syncs: Vec<String>,
 }
 
 /// Sync response
@@ -155,6 +159,9 @@ mod tests {
             mount_point: "/mnt/ghfs".to_string(),
             repo_count: 5,
             uptime_secs: 3600,
+            version: "0.1.0".to_string(),
+            pid: 1234,
+            pending_syncs: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
 

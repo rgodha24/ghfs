@@ -31,7 +31,7 @@ struct ViewState {
     error: Option<String>,
 }
 
-pub fn run_status_tui() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;

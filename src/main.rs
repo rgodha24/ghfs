@@ -7,7 +7,7 @@ pub mod types;
 
 use clap::{Parser, Subcommand};
 
-use crate::cli::{Client, ClientError, run_status_tui};
+use crate::cli::{Client, ClientError, run_tui};
 use crate::types::RepoKey;
 
 #[derive(Parser)]
@@ -30,6 +30,9 @@ enum Commands {
 
     /// Show daemon status
     Status,
+
+    /// Open interactive TUI
+    Tui,
 
     /// Force sync a repository
     Sync {
@@ -65,6 +68,7 @@ fn main() {
         Commands::Daemon => cmd_daemon(),
         Commands::Stop => cmd_stop(),
         Commands::Status => cmd_status(),
+        Commands::Tui => cmd_tui(),
         Commands::Sync { repo } => cmd_sync(&repo),
         Commands::Watch { repo } => cmd_watch(&repo),
         Commands::Unwatch { repo } => cmd_unwatch(&repo),
@@ -95,8 +99,12 @@ fn cmd_stop() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
+    cli::print_status()
+}
+
+fn cmd_tui() -> Result<(), Box<dyn std::error::Error>> {
     match Client::connect() {
-        Ok(_) => run_status_tui(),
+        Ok(_) => run_tui(),
         Err(ClientError::NotRunning) => {
             println!("Daemon is not running");
             Ok(())

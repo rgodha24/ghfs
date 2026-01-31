@@ -51,6 +51,9 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
                 mount_point: ctx.mount_point.clone(),
                 repo_count: repos.len(),
                 uptime_secs: ctx.start_time.elapsed().as_secs(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                pid: std::process::id(),
+                pending_syncs: vec![], // TODO: track pending syncs in worker
             }))
         }
 
