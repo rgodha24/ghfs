@@ -100,7 +100,7 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
         Request::List => {
             let repos = ctx
                 .state
-                .list_repos()
+                .list_repos_with_stats()
                 .map_err(|e| RpcError::internal(e.to_string()))?;
 
             let infos: Vec<RepoInfo> = repos
@@ -112,6 +112,9 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
                     generation: r.current_generation,
                     commit: r.head_commit,
                     last_sync: r.last_sync_at.map(format_timestamp),
+                    generation_count: r.generation_count,
+                    commit_count: r.commit_count,
+                    total_size_bytes: r.total_size_bytes,
                 })
                 .collect();
 

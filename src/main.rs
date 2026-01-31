@@ -7,7 +7,7 @@ pub mod types;
 
 use clap::{Parser, Subcommand};
 
-use crate::cli::{Client, ClientError};
+use crate::cli::{run_status_tui, Client, ClientError};
 use crate::types::RepoKey;
 
 #[derive(Parser)]
@@ -95,19 +95,14 @@ fn cmd_stop() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::connect()?;
-    let status = client.status()?;
-
-    println!("GHFS Daemon Status");
-    println!(
-        "  Running:     {}",
-        if status.running { "yes" } else { "no" }
-    );
-    println!("  Mount point: {}", status.mount_point);
-    println!("  Repos:       {}", status.repo_count);
-    println!("  Uptime:      {}", format_duration(status.uptime_secs));
-
-    Ok(())
+    match Client::connect() {
+        Ok(_) => run_status_tui(),
+        Err(ClientError::NotRunning) => {
+            println!("Daemon is not running");
+            Ok(())
+        }
+        Err(err) => Err(Box::new(err)),
+    }
 }
 
 fn cmd_sync(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -269,16 +264,4 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn format_duration(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else if secs < 86400 {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
-    }
 }

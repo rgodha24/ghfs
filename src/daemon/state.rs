@@ -38,6 +38,21 @@ pub struct RepoState {
     pub last_sync_at: Option<i64>,
 }
 
+/// Repo state with aggregated generation stats.
+#[derive(Debug, Clone)]
+pub struct RepoStats {
+    pub owner: String,
+    pub repo: String,
+    pub priority: i32,
+    pub current_generation: Option<u64>,
+    pub head_commit: Option<String>,
+    pub last_access_at: Option<i64>,
+    pub last_sync_at: Option<i64>,
+    pub generation_count: u64,
+    pub commit_count: u64,
+    pub total_size_bytes: u64,
+}
+
 impl State {
     /// Open or create the state database at the given path.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
@@ -52,6 +67,7 @@ impl State {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "
+            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS repos (
                 id INTEGER PRIMARY KEY,
                 owner TEXT NOT NULL,
@@ -61,14 +77,45 @@ impl State {
                 head_commit TEXT,
                 last_access_at INTEGER,
                 last_sync_at INTEGER,
+                mirror_size_bytes INTEGER DEFAULT 0,
                 UNIQUE(owner, repo)
+            );
+
+            CREATE TABLE IF NOT EXISTS generations (
+                id INTEGER PRIMARY KEY,
+                repo_id INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                commit_sha TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(repo_id, generation),
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_repos_sync ON repos(last_sync_at);
             CREATE INDEX IF NOT EXISTS idx_repos_priority ON repos(priority DESC, last_sync_at);
+            CREATE INDEX IF NOT EXISTS idx_generations_repo ON generations(repo_id);
             ",
         )?;
         Ok(())
+    }
+
+    /// Get or create a repo record, returning just the repo id.
+    pub fn get_or_create_repo_id(&self, key: &RepoKey) -> Result<i64, rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+        let conn = self.conn.lock().unwrap();
+
+        conn.execute(
+            "INSERT OR IGNORE INTO repos (owner, repo) VALUES (?1, ?2)",
+            params![owner, repo],
+        )?;
+
+        conn.query_row(
+            "SELECT id FROM repos WHERE owner = ?1 AND repo = ?2",
+            params![owner, repo],
+            |row| row.get(0),
+        )
     }
 
     /// Get or create a repo record, returning the repo state.
@@ -114,15 +161,27 @@ impl State {
         generation: u64,
         commit: &str,
     ) -> Result<(), rusqlite::Error> {
+        let now = now_unix();
+        self.update_sync_at(key, generation, commit, now)
+    }
+
+    /// Update repo after a successful sync with a provided timestamp.
+    pub fn update_sync_at(
+        &self,
+        key: &RepoKey,
+        generation: u64,
+        commit: &str,
+        ts: i64,
+    ) -> Result<(), rusqlite::Error> {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
-        let now = now_unix();
+        let _ = self.get_or_create_repo_id(key)?;
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
             "UPDATE repos SET current_generation = ?1, head_commit = ?2, last_sync_at = ?3
              WHERE owner = ?4 AND repo = ?5",
-            params![generation as i64, commit, now, owner, repo],
+            params![generation as i64, commit, ts, owner, repo],
         )?;
         Ok(())
     }
@@ -132,6 +191,7 @@ impl State {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
         let now = now_unix();
+        let _ = self.get_or_create_repo_id(key)?;
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
@@ -145,6 +205,7 @@ impl State {
     pub fn set_priority(&self, key: &RepoKey, priority: i32) -> Result<(), rusqlite::Error> {
         let owner = key.owner.as_str();
         let repo = key.repo.as_str();
+        let _ = self.get_or_create_repo_id(key)?;
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
@@ -211,6 +272,105 @@ impl State {
         rows.collect()
     }
 
+    /// List all repos with aggregated generation stats.
+    pub fn list_repos_with_stats(&self) -> Result<Vec<RepoStats>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT r.owner, r.repo, r.priority, r.current_generation, r.head_commit, r.last_access_at, r.last_sync_at,
+                    COALESCE(g.gen_count, 0) AS gen_count,
+                    COALESCE(g.commit_count, 0) AS commit_count,
+                    COALESCE(g.total_size, 0) + COALESCE(r.mirror_size_bytes, 0) AS total_size
+             FROM repos r
+             LEFT JOIN (
+                 SELECT repo_id,
+                        COUNT(*) AS gen_count,
+                        COUNT(DISTINCT commit_sha) AS commit_count,
+                        SUM(size_bytes) AS total_size
+                 FROM generations
+                 GROUP BY repo_id
+             ) g ON g.repo_id = r.id
+             ORDER BY r.priority DESC, COALESCE(r.last_sync_at, 0)",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(RepoStats {
+                owner: row.get(0)?,
+                repo: row.get(1)?,
+                priority: row.get(2)?,
+                current_generation: i64_to_u64_opt(row.get(3)?),
+                head_commit: row.get(4)?,
+                last_access_at: row.get(5)?,
+                last_sync_at: row.get(6)?,
+                generation_count: row.get::<_, i64>(7)? as u64,
+                commit_count: row.get::<_, i64>(8)? as u64,
+                total_size_bytes: row.get::<_, i64>(9)? as u64,
+            })
+        })?;
+
+        rows.collect()
+    }
+
+    /// Insert or update a generation record for a repo.
+    pub fn upsert_generation(
+        &self,
+        key: &RepoKey,
+        generation: u64,
+        commit: &str,
+        size_bytes: u64,
+    ) -> Result<(), rusqlite::Error> {
+        let repo_id = self.get_or_create_repo_id(key)?;
+        self.upsert_generation_for_repo_id(repo_id, generation, commit, size_bytes)
+    }
+
+    /// Insert or update a generation record for a known repo id.
+    pub fn upsert_generation_for_repo_id(
+        &self,
+        repo_id: i64,
+        generation: u64,
+        commit: &str,
+        size_bytes: u64,
+    ) -> Result<(), rusqlite::Error> {
+        let now = now_unix();
+        let conn = self.conn.lock().unwrap();
+
+        conn.execute(
+            "INSERT INTO generations (repo_id, generation, commit_sha, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repo_id, generation) DO UPDATE SET
+                commit_sha = excluded.commit_sha,
+                size_bytes = excluded.size_bytes,
+                created_at = excluded.created_at",
+            params![
+                repo_id,
+                generation as i64,
+                commit,
+                size_bytes as i64,
+                now
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Update the stored mirror size for a repo.
+    pub fn update_mirror_size(
+        &self,
+        key: &RepoKey,
+        size_bytes: u64,
+    ) -> Result<(), rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+        let _ = self.get_or_create_repo_id(key)?;
+        let conn = self.conn.lock().unwrap();
+
+        conn.execute(
+            "UPDATE repos SET mirror_size_bytes = ?1 WHERE owner = ?2 AND repo = ?3",
+            params![size_bytes as i64, owner, repo],
+        )?;
+        Ok(())
+    }
+
     /// Delete a repo record.
     pub fn delete_repo(&self, key: &RepoKey) -> Result<(), rusqlite::Error> {
         let owner = key.owner.as_str();
@@ -224,6 +384,7 @@ impl State {
         Ok(())
     }
 }
+
 
 #[cfg(test)]
 mod tests {

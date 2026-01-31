@@ -2,6 +2,7 @@
 
 mod scheduler;
 mod socket;
+mod backfill;
 pub mod state;
 mod worker;
 
@@ -90,6 +91,7 @@ impl Daemon {
         let db_path = cache_paths.root().join("ghfs.db");
         let state = State::open(&db_path)?;
         state.init()?;
+        backfill::backfill_cache_state(&state, &cache_paths);
 
         Ok(Self {
             cache_paths,

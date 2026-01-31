@@ -48,6 +48,12 @@ pub struct RepoInfo {
     pub generation: Option<u64>,
     pub commit: Option<String>,
     pub last_sync: Option<String>, // Human-readable timestamp
+    #[serde(default)]
+    pub generation_count: u64,
+    #[serde(default)]
+    pub commit_count: u64,
+    #[serde(default)]
+    pub total_size_bytes: u64,
 }
 
 /// List response
