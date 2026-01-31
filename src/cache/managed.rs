@@ -36,7 +36,15 @@ impl ManagedCache {
         // Record access
         let _ = self.state.touch_access(key);
 
-        let result = self.cache.ensure_current_with_status(key)?;
+        let result = match self.cache.ensure_current_with_status(key) {
+            Ok(r) => r,
+            Err(e) => {
+                // Clean up DB entry if this repo was never successfully synced
+                // (i.e., it was a spurious access to a non-existent repo)
+                let _ = self.state.delete_repo_if_never_synced(key);
+                return Err(e);
+            }
+        };
 
         // Update state with new generation info
         if result.refreshed {
@@ -65,7 +73,14 @@ impl ManagedCache {
         // Record access
         let _ = self.state.touch_access(key);
 
-        let result = self.cache.force_refresh(key)?;
+        let result = match self.cache.force_refresh(key) {
+            Ok(r) => r,
+            Err(e) => {
+                // Clean up DB entry if this repo was never successfully synced
+                let _ = self.state.delete_repo_if_never_synced(key);
+                return Err(e);
+            }
+        };
 
         // Update state with new generation info
         let _ = self

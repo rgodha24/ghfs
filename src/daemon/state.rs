@@ -377,6 +377,24 @@ impl State {
         )?;
         Ok(())
     }
+
+    /// Delete a repo only if it was never successfully synced.
+    ///
+    /// This is used to clean up spurious entries created when accessing
+    /// non-existent repos (e.g., /mnt/github/owner/venv).
+    /// Returns true if the repo was deleted, false if it had sync data.
+    pub fn delete_repo_if_never_synced(&self, key: &RepoKey) -> Result<bool, rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+        let conn = self.conn.lock().unwrap();
+
+        let rows_affected = conn.execute(
+            "DELETE FROM repos WHERE owner = ?1 AND repo = ?2
+             AND current_generation IS NULL AND last_sync_at IS NULL",
+            params![owner, repo],
+        )?;
+        Ok(rows_affected > 0)
+    }
 }
 
 #[cfg(test)]
@@ -506,5 +524,39 @@ mod tests {
 
         let repo = state.get_or_create_repo(&key).unwrap();
         assert_eq!(repo.priority, -5);
+    }
+
+    #[test]
+    fn test_delete_repo_if_never_synced() {
+        let (state, _dir) = create_test_state();
+
+        // Create a repo that was never synced
+        let key_never_synced = make_repo_key("fake", "venv");
+        state.get_or_create_repo(&key_never_synced).unwrap();
+
+        // Create a repo that was successfully synced
+        let key_synced = make_repo_key("real", "repo");
+        state.get_or_create_repo(&key_synced).unwrap();
+        state.update_sync(&key_synced, 1, "abc123").unwrap();
+
+        // delete_repo_if_never_synced should delete the never-synced repo
+        let deleted = state
+            .delete_repo_if_never_synced(&key_never_synced)
+            .unwrap();
+        assert!(deleted);
+
+        // Verify it's actually gone
+        let repos = state.list_repos().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].owner, "real");
+
+        // delete_repo_if_never_synced should NOT delete the synced repo
+        let deleted = state.delete_repo_if_never_synced(&key_synced).unwrap();
+        assert!(!deleted);
+
+        // Verify it's still there
+        let repos = state.list_repos().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].owner, "real");
     }
 }
