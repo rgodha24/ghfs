@@ -3,8 +3,8 @@
 //! This module provides a scheduler that periodically checks for stale repositories
 //! and triggers background refreshes via the worker thread.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 

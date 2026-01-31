@@ -1,19 +1,19 @@
 //! Daemon module for background sync operations.
 
+mod backfill;
 mod scheduler;
 mod socket;
-mod backfill;
 pub mod state;
 mod worker;
 
 pub use scheduler::SchedulerHandle;
-pub use socket::{socket_path, SocketServerHandle};
+pub use socket::{SocketServerHandle, socket_path};
 pub use state::{RepoState, State};
 pub use worker::{WorkerHandle, WorkerRequest};
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use thiserror::Error;
 
@@ -64,9 +64,10 @@ pub(crate) fn spawn_unmount(mount_point: String) {
             .status();
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let status: Result<std::process::ExitStatus, std::io::Error> = Err(
-            std::io::Error::new(std::io::ErrorKind::Unsupported, "Unsupported platform"),
-        );
+        let status: Result<std::process::ExitStatus, std::io::Error> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Unsupported platform",
+        ));
 
         match status {
             Ok(s) if s.success() => {}

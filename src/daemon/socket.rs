@@ -3,16 +3,16 @@
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::daemon::state::State;
 use crate::daemon::worker::WorkerHandle;
 use crate::protocol::{
-    read_request, write_message, ListResult, RepoInfo, Request, Response, RpcError,
-    RpcErrorResponse, RpcResponse, StatusResult, SyncResult,
+    ListResult, RepoInfo, Request, Response, RpcError, RpcErrorResponse, RpcResponse, StatusResult,
+    SyncResult, read_request, write_message,
 };
 use crate::types::RepoKey;
 

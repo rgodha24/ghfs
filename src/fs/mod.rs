@@ -3,8 +3,8 @@
 use crate::cache::CachePaths;
 use crate::daemon::WorkerHandle;
 use crate::types::{GenerationId, Owner, Repo, RepoKey};
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request,
@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod inode;
 
 pub use inode::{
-    InodeInfo, InodeTable, UnderlyingKey, PASSTHROUGH_INO_START, ROOT_INO, VIRTUAL_INO_END,
+    InodeInfo, InodeTable, PASSTHROUGH_INO_START, ROOT_INO, UnderlyingKey, VIRTUAL_INO_END,
     VIRTUAL_INO_START,
 };
 

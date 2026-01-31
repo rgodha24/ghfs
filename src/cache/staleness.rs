@@ -72,7 +72,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_is_stale_old_symlink() {
-        use filetime::{set_symlink_file_times, FileTime};
+        use filetime::{FileTime, set_symlink_file_times};
 
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_touch_symlink_updates_mtime() {
-        use filetime::{set_symlink_file_times, FileTime};
+        use filetime::{FileTime, set_symlink_file_times};
 
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");

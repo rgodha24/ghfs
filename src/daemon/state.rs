@@ -1,6 +1,6 @@
 //! SQLite-based state persistence for tracking repos, sync state, and priorities.
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -341,13 +341,7 @@ impl State {
                 commit_sha = excluded.commit_sha,
                 size_bytes = excluded.size_bytes,
                 created_at = excluded.created_at",
-            params![
-                repo_id,
-                generation as i64,
-                commit,
-                size_bytes as i64,
-                now
-            ],
+            params![repo_id, generation as i64, commit, size_bytes as i64, now],
         )?;
 
         Ok(())
@@ -384,7 +378,6 @@ impl State {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {

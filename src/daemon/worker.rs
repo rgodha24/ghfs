@@ -3,7 +3,7 @@
 //! This module provides a worker thread that handles git operations (clone, fetch,
 //! worktree creation) off the FUSE thread to avoid blocking filesystem operations.
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::sync::mpsc as oneshot;
 use std::thread::{self, JoinHandle};
 

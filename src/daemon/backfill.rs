@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cache::{open_repository, CachePaths};
+use crate::cache::{CachePaths, open_repository};
 use crate::daemon::state::State;
 use crate::types::{Owner, Repo, RepoKey};
 
@@ -75,12 +75,8 @@ pub fn backfill_cache_state(state: &State, cache_paths: &CachePaths) {
                         None => continue,
                     };
                     let size_bytes = dir_size(&path);
-                    let _ = state.upsert_generation_for_repo_id(
-                        repo_id,
-                        generation,
-                        &commit,
-                        size_bytes,
-                    );
+                    let _ = state
+                        .upsert_generation_for_repo_id(repo_id, generation, &commit, size_bytes);
                     gen_commits.insert(generation, commit);
                 }
             }
@@ -111,7 +107,8 @@ pub fn backfill_cache_state(state: &State, cache_paths: &CachePaths) {
 }
 
 fn parse_generation(name: &str) -> Option<u64> {
-    name.strip_prefix("gen-").and_then(|s| s.parse::<u64>().ok())
+    name.strip_prefix("gen-")
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 fn read_commit(path: &Path) -> Option<String> {
@@ -134,7 +131,10 @@ fn resolve_symlink_target(link_path: &Path, target: PathBuf) -> PathBuf {
 fn symlink_mtime_secs(path: &Path) -> Option<i64> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
-    let secs = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     Some(secs as i64)
 }
 

@@ -5,7 +5,7 @@
 //! and symlink swapping.
 
 use super::git::{open_repository, resolve_default_branch};
-use super::{atomic_symlink_swap, is_stale, CachePaths, GitCli, RepoLock};
+use super::{CachePaths, GitCli, RepoLock, atomic_symlink_swap, is_stale};
 use crate::types::{GenerationId, RepoKey};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
