@@ -32,4 +32,4 @@ GHFS_RUN_NETWORK_TESTS=1 nix develop -c cargo test
 ## other stuff
 
 this has no users yet. do NOT worry about 'breaking changes' and preserving compatibility until we hit v0.1.0.
-always run `cargo fmt` before committing.
+always run `nix develop -c cargo fmt` before committing.

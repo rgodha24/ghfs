@@ -26,7 +26,11 @@ enum Commands {
     Daemon,
 
     /// Stop the running daemon
-    Stop,
+    Stop {
+        /// Kill processes with files open under the mount before stopping
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// Show daemon status
     Status,
@@ -66,7 +70,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Daemon => cmd_daemon(),
-        Commands::Stop => cmd_stop(),
+        Commands::Stop { force } => cmd_stop(force),
         Commands::Status => cmd_status(),
         Commands::Tui => cmd_tui(),
         Commands::Sync { repo } => cmd_sync(&repo),
@@ -91,11 +95,67 @@ fn cmd_daemon() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_stop() -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_stop(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if force {
+        // Find processes with files open under the mount and kill them
+        let pids = find_open_file_pids(daemon::MOUNT_POINT);
+        if !pids.is_empty() {
+            println!("Killing {} process(es) with open files...", pids.len());
+            for pid in &pids {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+            // Give processes time to die
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     let mut client = Client::connect()?;
     client.stop()?;
     println!("Daemon stopped");
     Ok(())
+}
+
+/// Find PIDs of processes with files open under the given path.
+fn find_open_file_pids(target_path: &str) -> Vec<u32> {
+    use std::fs;
+
+    let mut pids = Vec::new();
+
+    let Ok(proc_dir) = fs::read_dir("/proc") else {
+        return pids;
+    };
+
+    for entry in proc_dir.flatten() {
+        let pid_str = entry.file_name();
+        let pid_str = pid_str.to_string_lossy();
+
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+
+        // Skip our own process
+        if pid == std::process::id() {
+            continue;
+        }
+
+        let fd_dir = format!("/proc/{}/fd", pid);
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue;
+        };
+
+        for fd_entry in fds.flatten() {
+            if let Ok(link_target) = fs::read_link(fd_entry.path()) {
+                if link_target.to_string_lossy().starts_with(target_path) {
+                    pids.push(pid);
+                    break;
+                }
+            }
+        }
+    }
+
+    pids
 }
 
 fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
