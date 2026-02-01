@@ -97,6 +97,70 @@ impl ManagedCache {
 
         Ok(result)
     }
+
+    /// Unshallow a repo: fetch full history for the default branch.
+    /// Updates access time and sync state in database.
+    pub fn unshallow(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
+        let _ = self.state.get_or_create_repo(key);
+        // Record access
+        let _ = self.state.touch_access(key);
+
+        let result = match self.cache.unshallow(key) {
+            Ok(r) => r,
+            Err(e) => {
+                // Clean up DB entry if this repo was never successfully synced
+                let _ = self.state.delete_repo_if_never_synced(key);
+                return Err(e);
+            }
+        };
+
+        // Update state with generation info
+        let _ = self
+            .state
+            .update_sync(key, result.generation.as_u64(), &result.commit);
+        let _ = self.state.upsert_generation(
+            key,
+            result.generation.as_u64(),
+            &result.commit,
+            dir_size(&result.path),
+        );
+        let mirror_size = dir_size(self.cache.paths().mirror_dir(key));
+        let _ = self.state.update_mirror_size(key, mirror_size);
+
+        Ok(result)
+    }
+
+    /// Reshallow a repo: convert back to depth=1 and run gc.
+    /// Updates access time and sync state in database.
+    pub fn reshallow(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
+        let _ = self.state.get_or_create_repo(key);
+        // Record access
+        let _ = self.state.touch_access(key);
+
+        let result = match self.cache.reshallow(key) {
+            Ok(r) => r,
+            Err(e) => {
+                // Clean up DB entry if this repo was never successfully synced
+                let _ = self.state.delete_repo_if_never_synced(key);
+                return Err(e);
+            }
+        };
+
+        // Update state with generation info
+        let _ = self
+            .state
+            .update_sync(key, result.generation.as_u64(), &result.commit);
+        let _ = self.state.upsert_generation(
+            key,
+            result.generation.as_u64(),
+            &result.commit,
+            dir_size(&result.path),
+        );
+        let mirror_size = dir_size(self.cache.paths().mirror_dir(key));
+        let _ = self.state.update_mirror_size(key, mirror_size);
+
+        Ok(result)
+    }
 }
 
 fn dir_size(path: impl AsRef<std::path::Path>) -> u64 {

@@ -56,6 +56,20 @@ enum Commands {
         repo: String,
     },
 
+    /// Fetch full git history for a repository
+    #[command(name = "unshallow")]
+    Unshallow {
+        /// Repository in owner/repo format
+        repo: String,
+    },
+
+    /// Convert a repository back to shallow clone (depth=1)
+    #[command(name = "reshallow")]
+    Reshallow {
+        /// Repository in owner/repo format
+        repo: String,
+    },
+
     /// List known repositories
     List,
 
@@ -76,6 +90,8 @@ fn main() {
         Commands::Sync { repo } => cmd_sync(&repo),
         Commands::Watch { repo } => cmd_watch(&repo),
         Commands::Unwatch { repo } => cmd_unwatch(&repo),
+        Commands::Unshallow { repo } => cmd_unshallow(&repo),
+        Commands::Reshallow { repo } => cmd_reshallow(&repo),
         Commands::List => cmd_list(),
         Commands::Doctor => cmd_doctor(),
     };
@@ -224,6 +240,54 @@ fn cmd_unwatch(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn cmd_unshallow(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let _: RepoKey = repo
+        .parse()
+        .map_err(|e| format!("Invalid repo format: {}", e))?;
+
+    println!("Fetching full history for {}...", repo);
+
+    let mut client = Client::connect()?;
+    let result = client.unshallow(repo)?;
+
+    println!("Unshallowed successfully");
+    println!("  Generation: {}", result.generation);
+    println!(
+        "  Commit:     {}",
+        if result.commit.len() > 12 {
+            &result.commit[..12]
+        } else {
+            &result.commit
+        }
+    );
+
+    Ok(())
+}
+
+fn cmd_reshallow(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let _: RepoKey = repo
+        .parse()
+        .map_err(|e| format!("Invalid repo format: {}", e))?;
+
+    println!("Converting {} to shallow clone...", repo);
+
+    let mut client = Client::connect()?;
+    let result = client.reshallow(repo)?;
+
+    println!("Reshallowed successfully");
+    println!("  Generation: {}", result.generation);
+    println!(
+        "  Commit:     {}",
+        if result.commit.len() > 12 {
+            &result.commit[..12]
+        } else {
+            &result.commit
+        }
+    );
+
+    Ok(())
+}
+
 fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = Client::connect()?;
     let result = client.list()?;
@@ -234,10 +298,10 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "{:<40} {:>8} {:>12} {:>15} {:>15}",
+        "{:<40} {:>12} {:>12} {:>15} {:>15}",
         "REPO", "PRIORITY", "GENERATION", "LAST SYNC", "LAST ACCESS"
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(100));
 
     for repo in result.repos {
         let repo_name = format!("{}/{}", repo.owner, repo.repo);
@@ -246,15 +310,17 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "-".to_string()
         };
-        let generation = repo
-            .generation
-            .map(|g| g.to_string())
-            .unwrap_or_else(|| "-".to_string());
+        let generation = match (repo.generation, repo.shallow) {
+            (Some(_), Some(true)) => "shallow".to_string(),
+            (Some(g), Some(false)) => g.to_string(),
+            (Some(g), None) => g.to_string(),
+            (None, _) => "-".to_string(),
+        };
         let last_sync = repo.last_sync.unwrap_or_else(|| "never".to_string());
         let last_access = repo.last_access.unwrap_or_else(|| "never".to_string());
 
         println!(
-            "{:<40} {:>8} {:>12} {:>15} {:>15}",
+            "{:<40} {:>12} {:>12} {:>15} {:>15}",
             repo_name, priority, generation, last_sync, last_access
         );
     }

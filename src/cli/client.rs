@@ -132,6 +132,26 @@ impl Client {
         }
     }
 
+    /// Convenience: unshallow a repo (fetch full history)
+    pub fn unshallow(&mut self, repo: &str) -> Result<SyncResult, ClientError> {
+        match self.call(Request::UnshallowRepo {
+            repo: repo.to_string(),
+        })? {
+            Response::Sync(s) => Ok(s),
+            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Convenience: reshallow a repo (convert back to depth=1)
+    pub fn reshallow(&mut self, repo: &str) -> Result<SyncResult, ClientError> {
+        match self.call(Request::ReshallowRepo {
+            repo: repo.to_string(),
+        })? {
+            Response::Sync(s) => Ok(s),
+            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
+        }
+    }
+
     /// Convenience: list repos
     pub fn list(&mut self) -> Result<ListResult, ClientError> {
         match self.call(Request::List)? {

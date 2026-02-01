@@ -125,6 +125,7 @@ impl Daemon {
         let _socket_server = SocketServerHandle::spawn(
             Arc::clone(&self.state),
             Arc::clone(&worker),
+            self.cache_paths.clone(),
             self.mount_point.to_string_lossy().to_string(),
             Arc::clone(&self.shutdown),
         )?;

@@ -27,6 +27,18 @@ pub enum WorkerRequest {
         reply: oneshot::Sender<Result<GenerationRef, CacheError>>,
     },
 
+    /// Unshallow a repo (fetch full history).
+    Unshallow {
+        repo: RepoKey,
+        reply: oneshot::Sender<Result<GenerationRef, CacheError>>,
+    },
+
+    /// Reshallow a repo (convert back to depth=1).
+    Reshallow {
+        repo: RepoKey,
+        reply: oneshot::Sender<Result<GenerationRef, CacheError>>,
+    },
+
     /// Shutdown the worker.
     Shutdown,
 }
@@ -63,6 +75,16 @@ impl Worker {
                 Ok(WorkerRequest::Sync { repo, reply }) => {
                     log::debug!("Force sync for repo: {}", repo);
                     let result = self.cache.force_refresh(&repo);
+                    let _ = reply.send(result);
+                }
+                Ok(WorkerRequest::Unshallow { repo, reply }) => {
+                    log::debug!("Unshallow for repo: {}", repo);
+                    let result = self.cache.unshallow(&repo);
+                    let _ = reply.send(result);
+                }
+                Ok(WorkerRequest::Reshallow { repo, reply }) => {
+                    log::debug!("Reshallow for repo: {}", repo);
+                    let result = self.cache.reshallow(&repo);
                     let _ = reply.send(result);
                 }
                 Ok(WorkerRequest::Shutdown) => {
@@ -126,6 +148,24 @@ impl WorkerHandle {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(WorkerRequest::Sync { repo, reply: tx })
+            .map_err(|_| CacheError::LockFailed)?;
+        rx.recv().map_err(|_| CacheError::LockFailed)?
+    }
+
+    /// Request unshallow (blocking until complete).
+    pub fn unshallow(&self, repo: RepoKey) -> Result<GenerationRef, CacheError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(WorkerRequest::Unshallow { repo, reply: tx })
+            .map_err(|_| CacheError::LockFailed)?;
+        rx.recv().map_err(|_| CacheError::LockFailed)?
+    }
+
+    /// Request reshallow (blocking until complete).
+    pub fn reshallow(&self, repo: RepoKey) -> Result<GenerationRef, CacheError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(WorkerRequest::Reshallow { repo, reply: tx })
             .map_err(|_| CacheError::LockFailed)?;
         rx.recv().map_err(|_| CacheError::LockFailed)?
     }

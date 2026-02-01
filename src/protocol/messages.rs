@@ -16,6 +16,14 @@ pub enum Request {
     /// Unwatch a repo (reset priority)
     Unwatch { repo: String },
 
+    /// Unshallow a repo (fetch full history)
+    #[serde(rename = "unshallow")]
+    UnshallowRepo { repo: String },
+
+    /// Reshallow a repo (convert back to depth=1)
+    #[serde(rename = "reshallow")]
+    ReshallowRepo { repo: String },
+
     /// List all known repos
     List,
 
@@ -59,6 +67,9 @@ pub struct RepoInfo {
     pub commit_count: u64,
     #[serde(default)]
     pub total_size_bytes: u64,
+    /// Whether the mirror is a shallow clone (None if mirror doesn't exist)
+    #[serde(default)]
+    pub shallow: Option<bool>,
 }
 
 /// List response

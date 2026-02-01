@@ -9,7 +9,8 @@ mod staleness;
 mod swap;
 
 pub use git::{
-    GitCli, GitError, clone_bare_shallow, create_worktree, fetch_shallow, open_repository,
+    GitCli, GitError, clone_bare_full, clone_bare_shallow, create_worktree, fetch_full,
+    fetch_reshallow, fetch_shallow, fetch_unshallow, is_shallow_repo, open_repository,
     repository_exists, resolve_default_branch,
 };
 pub use lock::RepoLock;
