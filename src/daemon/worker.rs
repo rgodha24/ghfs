@@ -7,7 +7,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use std::sync::mpsc as oneshot;
 use std::thread::{self, JoinHandle};
 
-use crate::cache::{CacheError, GenerationRef, ManagedCache};
+use crate::cache::{CacheError, GenerationRef, ManagedCache, NegativeCache};
 use crate::types::RepoKey;
 
 /// Requests the worker can handle.
@@ -47,12 +47,18 @@ pub enum WorkerRequest {
 pub struct Worker {
     receiver: Receiver<WorkerRequest>,
     cache: ManagedCache,
+    /// Cache of repos that are known not to exist.
+    negative_cache: NegativeCache,
 }
 
 impl Worker {
     /// Create a new worker with the given receiver and cache.
     pub fn new(receiver: Receiver<WorkerRequest>, cache: ManagedCache) -> Self {
-        Self { receiver, cache }
+        Self {
+            receiver,
+            cache,
+            negative_cache: NegativeCache::new(),
+        }
     }
 
     /// Run the worker loop (blocks until Shutdown).
@@ -62,11 +68,34 @@ impl Worker {
         loop {
             match self.receiver.recv() {
                 Ok(WorkerRequest::Materialize { repo, reply }) => {
+                    // Check negative cache first
+                    if self.negative_cache.contains(&repo) {
+                        log::debug!("Repo {} is in negative cache, skipping", repo);
+                        let _ = reply.send(Err(CacheError::RepoNotFound(repo.to_string())));
+                        continue;
+                    }
+
                     log::debug!("Materializing repo: {}", repo);
                     let result = self.cache.ensure_current(&repo);
+
+                    // If materialization failed, check if we should add to negative cache
+                    if let Err(ref e) = result {
+                        log::debug!("Materialization failed for {}: {}", repo, e);
+                        // Only check for not-found on git errors (clone failures)
+                        if matches!(e, CacheError::Git(_)) {
+                            self.negative_cache.insert_if_not_exists(&repo);
+                        }
+                    }
+
                     let _ = reply.send(result);
                 }
                 Ok(WorkerRequest::Refresh { repo }) => {
+                    // Skip refresh for repos in negative cache
+                    if self.negative_cache.contains(&repo) {
+                        log::debug!("Repo {} is in negative cache, skipping refresh", repo);
+                        continue;
+                    }
+
                     log::debug!("Background refresh for repo: {}", repo);
                     if let Err(e) = self.cache.ensure_current(&repo) {
                         log::warn!("Background refresh failed for {}: {}", repo, e);

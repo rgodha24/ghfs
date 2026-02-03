@@ -29,6 +29,9 @@ pub enum CacheError {
     /// The current symlink points at a missing target.
     #[error("symlink target does not exist: {0}")]
     SymlinkTargetMissing(PathBuf),
+    /// The repository does not exist on GitHub.
+    #[error("repository does not exist: {0}")]
+    RepoNotFound(String),
 }
 
 /// A reference to a materialized repo generation.

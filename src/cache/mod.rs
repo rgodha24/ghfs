@@ -3,6 +3,7 @@
 mod git;
 mod lock;
 mod managed;
+mod negative;
 mod paths;
 mod repo;
 mod staleness;
@@ -15,6 +16,7 @@ pub use git::{
 };
 pub use lock::RepoLock;
 pub use managed::ManagedCache;
+pub use negative::NegativeCache;
 pub use paths::CachePaths;
 pub use repo::{CacheError, GenerationRef, RepoCache};
 pub use staleness::{is_stale, touch_symlink};
