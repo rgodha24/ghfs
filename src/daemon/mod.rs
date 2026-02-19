@@ -20,8 +20,26 @@ use thiserror::Error;
 use crate::cache::{CachePaths, ManagedCache};
 use crate::fs::GhFs;
 
-/// The mount point (hardcoded for now)
-pub const MOUNT_POINT: &str = "/mnt/github";
+/// Default mount point on Linux.
+#[cfg(target_os = "linux")]
+pub const DEFAULT_MOUNT_POINT: &str = "/mnt/github";
+
+/// Default mount point on macOS.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_MOUNT_POINT: &str = "/tmp/ghfs";
+
+/// Default mount point for other platforms.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const DEFAULT_MOUNT_POINT: &str = "/tmp/ghfs";
+
+/// Resolve the mount point, allowing override via GHFS_MOUNT_POINT.
+pub fn mount_point() -> PathBuf {
+    if let Some(custom) = std::env::var_os("GHFS_MOUNT_POINT") {
+        return PathBuf::from(custom);
+    }
+
+    PathBuf::from(DEFAULT_MOUNT_POINT)
+}
 
 /// Errors that can occur when running the daemon.
 #[derive(Error, Debug)]
@@ -47,7 +65,7 @@ pub struct Daemon {
     shutdown: Arc<AtomicBool>,
 }
 
-/// Spawn a detached thread to unmount the FUSE filesystem.
+/// Spawn a detached thread to unmount the active filesystem backend.
 pub(crate) fn spawn_unmount(mount_point: String) {
     std::thread::spawn(move || {
         // Small delay to allow any response to be sent first.
@@ -59,9 +77,27 @@ pub(crate) fn spawn_unmount(mount_point: String) {
             .status();
 
         #[cfg(target_os = "macos")]
-        let status = std::process::Command::new("umount")
-            .arg(&mount_point)
-            .status();
+        let status = {
+            let first = std::process::Command::new("diskutil")
+                .args(["unmount", &mount_point])
+                .status();
+
+            match first {
+                Ok(exit) if exit.success() => Ok(exit),
+                _ => {
+                    let second = std::process::Command::new("diskutil")
+                        .args(["unmount", "force", &mount_point])
+                        .status();
+
+                    match second {
+                        Ok(exit) if exit.success() => Ok(exit),
+                        _ => std::process::Command::new("umount")
+                            .arg(&mount_point)
+                            .status(),
+                    }
+                }
+            }
+        };
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let status: Result<std::process::ExitStatus, std::io::Error> = Err(std::io::Error::new(
@@ -81,7 +117,7 @@ impl Daemon {
     /// Create a new daemon instance.
     pub fn new() -> Result<Self, DaemonError> {
         let cache_paths = CachePaths::default();
-        let mount_point = PathBuf::from(MOUNT_POINT);
+        let mount_point = mount_point();
 
         // Ensure cache directories exist
         std::fs::create_dir_all(cache_paths.mirrors_dir())?;
@@ -109,7 +145,7 @@ impl Daemon {
         log::info!("Cache: {}", self.cache_paths.root().display());
         log::info!("Socket: {}", socket_path().display());
 
-        // Ensure mount point exists
+        // Ensure mount point exists.
         if !self.mount_point.exists() {
             std::fs::create_dir_all(&self.mount_point)?;
         }
@@ -147,18 +183,25 @@ impl Daemon {
         })
         .expect("failed to set signal handler");
 
-        // Create and mount FUSE filesystem
+        // Create and mount filesystem backend.
         let fs = GhFs::new(Arc::clone(&worker), self.cache_paths.clone());
 
-        log::info!("Mounting FUSE filesystem");
+        #[cfg(target_os = "linux")]
+        log::info!("Mounting Linux FUSE filesystem");
+
+        #[cfg(target_os = "macos")]
+        log::info!("Mounting macOS NFS filesystem");
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        log::info!("Mounting filesystem backend");
 
         // This blocks until unmount
         if let Err(e) = fs.mount(&self.mount_point) {
-            log::error!("FUSE mount failed: {}", e);
+            log::error!("Mount failed: {}", e);
             return Err(DaemonError::Mount(e));
         }
 
-        log::info!("FUSE unmounted, shutting down");
+        log::info!("Filesystem unmounted, shutting down");
 
         // Shutdown is triggered by unmount or signal
         // Threads will clean up via their Drop impls

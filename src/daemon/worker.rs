@@ -1,7 +1,7 @@
 //! Background worker thread for git operations.
 //!
 //! This module provides a worker thread that handles git operations (clone, fetch,
-//! worktree creation) off the FUSE thread to avoid blocking filesystem operations.
+//! worktree creation) off the mount backend thread to avoid blocking filesystem operations.
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::sync::mpsc as oneshot;
@@ -12,7 +12,7 @@ use crate::types::RepoKey;
 
 /// Requests the worker can handle.
 pub enum WorkerRequest {
-    /// Materialize a repo (blocking - FUSE needs the result).
+    /// Materialize a repo (blocking - mount backend needs the result).
     Materialize {
         repo: RepoKey,
         reply: oneshot::Sender<Result<GenerationRef, CacheError>>,

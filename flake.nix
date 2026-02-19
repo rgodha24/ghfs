@@ -1,5 +1,5 @@
 {
-  description = "GHFS - GitHub Filesystem via FUSE";
+  description = "GHFS - GitHub Filesystem (Linux FUSE, macOS NFS)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -40,7 +40,7 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [pkgs.pkg-config];
+          nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.pkg-config];
 
           buildInputs = fuseDeps;
 
@@ -59,7 +59,7 @@
             homepage = "https://github.com/rgodha24/ghfs";
             license = licenses.mit;
             maintainers = [];
-            platforms = platforms.linux; # macOS requires macFUSE installed separately
+            platforms = platforms.unix;
           };
         };
 
@@ -67,17 +67,22 @@
           buildInputs =
             [
               rust
-              pkgs.pkg-config
               pkgs.git
               pkgs.cargo-watch
               pkgs.cargo-nextest
             ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.pkg-config]
             ++ fuseDeps;
 
           shellHook = ''
             echo "ghfs dev shell"
             echo "  rust: $(rustc --version)"
-            echo "  fuse3: $(pkg-config --modversion fuse3 2>/dev/null || echo 'not found')"
+            ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              echo "  fuse3: $(pkg-config --modversion fuse3 2>/dev/null || echo 'not found')"
+            ''}
+            ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              echo "  mount_nfs: $(command -v mount_nfs >/dev/null && echo 'available' || echo 'not found')"
+            ''}
           '';
         };
       }

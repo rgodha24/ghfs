@@ -175,7 +175,7 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
         }
 
         Request::Stop => {
-            // Trigger unmount to unblock the FUSE event loop.
+            // Trigger unmount to unblock the filesystem backend loop.
             super::spawn_unmount(ctx.mount_point.clone());
             Ok(Response::Ok(()))
         }

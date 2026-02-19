@@ -114,7 +114,8 @@ fn cmd_daemon() -> Result<(), Box<dyn std::error::Error>> {
 fn cmd_stop(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if force {
         // Find processes with files open under the mount and kill them
-        let pids = find_open_file_pids(daemon::MOUNT_POINT);
+        let mount_point = daemon::mount_point();
+        let pids = find_open_file_pids(mount_point.to_string_lossy().as_ref());
         if !pids.is_empty() {
             println!("Killing {} process(es) with open files...", pids.len());
             for pid in &pids {
@@ -343,22 +344,42 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
         if git_ok { "available" } else { "not found" }
     );
 
-    // Check FUSE
     #[cfg(target_os = "linux")]
-    let fuse_ok = std::path::Path::new("/dev/fuse").exists();
+    let (backend_ok, backend_label, backend_detail) = {
+        let ok = std::path::Path::new("/dev/fuse").exists();
+        let detail = if ok {
+            "available".to_string()
+        } else {
+            "not found (install FUSE)".to_string()
+        };
+        (ok, "FUSE backend", detail)
+    };
+
     #[cfg(target_os = "macos")]
-    let fuse_ok = std::path::Path::new("/Library/Filesystems/macfuse.fs").exists();
+    let (backend_ok, backend_label, backend_detail) = {
+        let mount_nfs_ok = std::process::Command::new("mount_nfs")
+            .arg("-h")
+            .output()
+            .is_ok();
+
+        let detail = if mount_nfs_ok {
+            "mount_nfs available".to_string()
+        } else {
+            "mount_nfs not found (install/enable macOS NFS client tools)".to_string()
+        };
+
+        (mount_nfs_ok, "NFS backend", detail)
+    };
+
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let fuse_ok = false;
+    let (backend_ok, backend_label, backend_detail) =
+        (false, "Backend", "unsupported platform".to_string());
 
     println!(
-        "[{}] FUSE: {}",
-        if fuse_ok { "OK" } else { "FAIL" },
-        if fuse_ok {
-            "available"
-        } else {
-            "not found (install FUSE)"
-        }
+        "[{}] {}: {}",
+        if backend_ok { "OK" } else { "FAIL" },
+        backend_label,
+        backend_detail
     );
 
     // Check cache directory
@@ -386,15 +407,15 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Check mount point
-    let mount_point = std::path::Path::new(daemon::MOUNT_POINT);
+    let mount_point = daemon::mount_point();
     let mount_ok = mount_point.exists();
     println!(
         "[{}] Mount point: {}",
         if mount_ok { "OK" } else { "INFO" },
-        daemon::MOUNT_POINT
+        mount_point.display()
     );
 
-    if !git_ok || !fuse_ok {
+    if !git_ok || !backend_ok {
         std::process::exit(1);
     }
 
