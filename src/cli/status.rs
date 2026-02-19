@@ -117,8 +117,26 @@ pub fn print_status() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => return Err(Box::new(e)),
     };
 
-    // Get status from daemon
-    let status = client.status()?;
+    // Get status from daemon. If the daemon exits between connect and request,
+    // treat it as not running instead of surfacing transport errors.
+    let status = match client.status() {
+        Ok(status) => status,
+        Err(ClientError::NotRunning) => {
+            println!("Daemon: not running");
+            return Ok(());
+        }
+        Err(e) => return Err(Box::new(e)),
+    };
+
+    // Get repo list up front so output is consistent if daemon exits mid-command.
+    let list = match client.list() {
+        Ok(list) => list,
+        Err(ClientError::NotRunning) => {
+            println!("Daemon: not running");
+            return Ok(());
+        }
+        Err(e) => return Err(Box::new(e)),
+    };
 
     // Daemon status section
     println!("Daemon");
@@ -128,9 +146,6 @@ pub fn print_status() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Uptime:     {}", format_uptime(status.uptime_secs));
     println!("  Mount:      {}", status.mount_point);
     println!();
-
-    // Get repo list
-    let list = client.list()?;
 
     // Synced repos section
     println!("Repositories ({})", list.repos.len());

@@ -51,11 +51,29 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+fn is_not_running_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    ) || matches!(
+        err.raw_os_error(),
+        Some(libc::ECONNREFUSED)
+            | Some(libc::ENOENT)
+            | Some(libc::ECONNABORTED)
+            | Some(libc::ECONNRESET)
+            | Some(libc::EPIPE)
+            | Some(libc::ENOTCONN)
+    )
+}
+
 impl From<std::io::Error> for ClientError {
     fn from(e: std::io::Error) -> Self {
-        if e.kind() == std::io::ErrorKind::ConnectionRefused
-            || e.kind() == std::io::ErrorKind::NotFound
-        {
+        if is_not_running_io_error(&e) {
             ClientError::NotRunning
         } else {
             ClientError::Io(e)
@@ -166,5 +184,22 @@ impl Client {
             Response::Ok(()) => Ok(()),
             other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientError;
+
+    #[test]
+    fn maps_broken_pipe_to_not_running() {
+        let err = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(ClientError::from(err), ClientError::NotRunning));
+    }
+
+    #[test]
+    fn keeps_unrelated_io_errors_as_io() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(ClientError::from(err), ClientError::Io(_)));
     }
 }

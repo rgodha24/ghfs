@@ -626,6 +626,7 @@ impl GhFs {
         Ok(target.into_os_string().into_vec())
     }
 
+    #[cfg(target_os = "macos")]
     fn read_file_range(&self, ino: u64, offset: u64, size: u32) -> Result<(Vec<u8>, bool), i32> {
         if InodeTable::is_virtual(ino) {
             return Err(libc::EISDIR);
