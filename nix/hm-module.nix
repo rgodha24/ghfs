@@ -18,6 +18,11 @@ in {
     }
 
     (lib.mkIf pkgs.stdenv.isLinux {
+      home.packages = [
+        pkgs.git
+        pkgs.fuse3
+      ];
+
       systemd.user.services.ghfs = {
         Unit = {
           Description = "GHFS GitHub Filesystem";
@@ -28,7 +33,10 @@ in {
           ExecStart = "${cfg.package}/bin/ghfs daemon";
           Restart = "on-failure";
           RestartSec = 5;
-          Environment = ["RUST_LOG=info"];
+          Environment = [
+            "RUST_LOG=info"
+            "PATH=${lib.makeBinPath [ cfg.package pkgs.git pkgs.fuse3 ]}:/usr/bin:/bin:/usr/sbin:/sbin"
+          ];
         };
         Install = {
           WantedBy = ["default.target"];
@@ -48,6 +56,7 @@ in {
           StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/ghfs.err.log";
           EnvironmentVariables = {
             RUST_LOG = "info";
+            PATH = "${lib.makeBinPath [ cfg.package pkgs.git ]}:/usr/bin:/bin:/usr/sbin:/sbin";
           };
         };
       };

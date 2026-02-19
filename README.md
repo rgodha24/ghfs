@@ -14,6 +14,9 @@ ghfs service install
 ghfs service status
 ```
 
+Linux runtime requirements: `/dev/fuse` must exist and a fusermount helper (`fusermount3` or
+`fusermount`) must be installed.
+
 Available commands:
 
 ```bash

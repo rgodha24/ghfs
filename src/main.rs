@@ -11,6 +11,16 @@ use clap::{Parser, Subcommand};
 use crate::cli::{Client, ClientError, run_tui};
 use crate::types::RepoKey;
 
+fn command_in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(name))
+                .any(|candidate| candidate.is_file())
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Parser)]
 #[command(
     name = "ghfs",
@@ -328,11 +338,17 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "linux")]
     let (backend_ok, backend_label, backend_detail) = {
-        let ok = std::path::Path::new("/dev/fuse").exists();
+        let dev_fuse_ok = std::path::Path::new("/dev/fuse").exists();
+        let fuse_helper_ok = command_in_path("fusermount3") || command_in_path("fusermount");
+        let ok = dev_fuse_ok && fuse_helper_ok;
         let detail = if ok {
-            "available".to_string()
+            "available (/dev/fuse + fusermount helper)".to_string()
+        } else if !dev_fuse_ok && !fuse_helper_ok {
+            "missing /dev/fuse and fusermount helper (install/enable FUSE)".to_string()
+        } else if !dev_fuse_ok {
+            "missing /dev/fuse (install/enable FUSE kernel support)".to_string()
         } else {
-            "not found (install FUSE)".to_string()
+            "missing fusermount helper (install FUSE userspace tools, usually fuse3)".to_string()
         };
         (ok, "FUSE backend", detail)
     };

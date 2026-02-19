@@ -12,6 +12,7 @@ const SYSTEMD_SERVICE_NAME: &str = "ghfs";
 const SYSTEMD_UNIT_FILE: &str = "ghfs.service";
 const LAUNCHD_LABEL: &str = "com.ghfs.daemon";
 const LAUNCHD_PLIST_FILE: &str = "com.ghfs.daemon.plist";
+const DEFAULT_SERVICE_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
 
 #[derive(Debug, Clone, Copy)]
 pub enum ServiceBackend {
@@ -273,9 +274,12 @@ fn install_systemd(no_start: bool) -> Result<(), ServiceError> {
     }
 
     let exe = std::env::current_exe()?;
+    let path_env = service_path_env();
+    ensure_linux_fuse_helper_available(&path_env)?;
     let unit_contents = format!(
-        "[Unit]\nDescription=GHFS GitHub Filesystem\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=on-failure\nRestartSec=5\nEnvironment=RUST_LOG=info\n\n[Install]\nWantedBy=default.target\n",
-        exe.display()
+        "[Unit]\nDescription=GHFS GitHub Filesystem\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=on-failure\nRestartSec=5\nEnvironment=RUST_LOG=info\nEnvironment=\"PATH={}\"\n\n[Install]\nWantedBy=default.target\n",
+        exe.display(),
+        escape_systemd_value(&path_env),
     );
 
     fs::write(&unit_path, unit_contents)?;
@@ -370,12 +374,14 @@ fn install_launchd(no_start: bool) -> Result<(), ServiceError> {
     }
 
     let exe = std::env::current_exe()?;
+    let path_env = service_path_env();
     let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{label}</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>{exe}</string>\n        <string>daemon</string>\n    </array>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>{stdout_log}</string>\n    <key>StandardErrorPath</key>\n    <string>{stderr_log}</string>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>RUST_LOG</key>\n        <string>info</string>\n    </dict>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{label}</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>{exe}</string>\n        <string>daemon</string>\n    </array>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>{stdout_log}</string>\n    <key>StandardErrorPath</key>\n    <string>{stderr_log}</string>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>RUST_LOG</key>\n        <string>info</string>\n        <key>PATH</key>\n        <string>{path_env}</string>\n    </dict>\n</dict>\n</plist>\n",
         label = LAUNCHD_LABEL,
         exe = xml_escape(&exe.to_string_lossy()),
         stdout_log = xml_escape(&stdout_log.to_string_lossy()),
         stderr_log = xml_escape(&stderr_log.to_string_lossy()),
+        path_env = xml_escape(&path_env),
     );
 
     fs::write(&plist_path, plist)?;
@@ -689,6 +695,50 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn service_path_env() -> String {
+    match std::env::var("PATH") {
+        Ok(path) if !path.trim().is_empty() => {
+            if path.contains("/usr/bin") {
+                path
+            } else {
+                format!("{path}:{DEFAULT_SERVICE_PATH}")
+            }
+        }
+        _ => DEFAULT_SERVICE_PATH.to_string(),
+    }
+}
+
+fn escape_systemd_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn path_has_executable(path_env: &str, name: &str) -> bool {
+    std::env::split_paths(path_env)
+        .map(|dir| dir.join(name))
+        .any(|candidate| candidate.is_file())
+}
+
+fn ensure_linux_fuse_helper_available(path_env: &str) -> Result<(), ServiceError> {
+    #[cfg(target_os = "linux")]
+    {
+        if !path_has_executable(path_env, "fusermount3")
+            && !path_has_executable(path_env, "fusermount")
+        {
+            return Err(ServiceError::BackendUnavailable(
+                "fusermount helper not found in PATH. Install FUSE userspace tools (usually package 'fuse3').".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path_env;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

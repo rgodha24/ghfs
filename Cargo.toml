@@ -23,7 +23,7 @@ thiserror = "2"
 ureq = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.15", features = ["abi-7-19"] }
+fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 async-trait = "0.1"

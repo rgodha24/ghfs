@@ -1,4 +1,4 @@
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 
 let
   cfg = config.services.ghfs;
@@ -18,6 +18,11 @@ in {
       wantedBy = ["multi-user.target"];
       after = ["network-online.target"];
       wants = ["network-online.target"];
+      path = [
+        cfg.package
+        pkgs.git
+        pkgs.fuse3
+      ];
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/ghfs daemon";
