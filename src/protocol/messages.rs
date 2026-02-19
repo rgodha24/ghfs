@@ -27,6 +27,9 @@ pub enum Request {
     /// List all known repos
     List,
 
+    /// Get daemon version
+    Version,
+
     /// Stop the daemon
     Stop,
 }
@@ -78,6 +81,13 @@ pub struct ListResult {
     pub repos: Vec<RepoInfo>,
 }
 
+/// Version response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionResult {
+    pub version: String,
+    pub pid: u32,
+}
+
 /// All possible success responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -85,6 +95,7 @@ pub enum Response {
     Status(StatusResult),
     Sync(SyncResult),
     List(ListResult),
+    Version(VersionResult),
     Ok(()), // For watch/unwatch/stop - unit type serializes as null
 }
 
@@ -141,6 +152,15 @@ mod tests {
         // Status has no params, so just method
         assert!(json.contains(r#""method":"status""#));
         // Should not have params field for unit variant
+        assert!(!json.contains(r#""params""#));
+    }
+
+    #[test]
+    fn test_serialize_version_request_without_params() {
+        let req = Request::Version;
+        let json = serde_json::to_string(&req).unwrap();
+
+        assert!(json.contains(r#""method":"version""#));
         assert!(!json.contains(r#""params""#));
     }
 

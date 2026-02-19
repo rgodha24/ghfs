@@ -13,7 +13,7 @@ pub use worker::{WorkerHandle, WorkerRequest};
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
@@ -177,8 +177,10 @@ impl Daemon {
 
         // Setup signal handler for graceful shutdown
         let mount_point = self.mount_point.to_string_lossy().to_string();
+        let shutdown = Arc::clone(&self.shutdown);
         ctrlc::set_handler(move || {
             log::info!("Received shutdown signal");
+            shutdown.store(true, Ordering::SeqCst);
             spawn_unmount(mount_point.clone());
         })
         .expect("failed to set signal handler");
@@ -253,15 +255,4 @@ pub fn start() -> Result<(), DaemonError> {
     remove_pid_file();
 
     result
-}
-
-/// Stop a running daemon by sending the Stop command.
-pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
-    use crate::cli::Client;
-    use crate::protocol::Request;
-
-    let mut client = Client::connect()?;
-    client.call(Request::Stop)?;
-
-    Ok(())
 }

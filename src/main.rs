@@ -3,6 +3,7 @@ pub mod cli;
 pub mod daemon;
 pub mod fs;
 pub mod protocol;
+pub mod service;
 pub mod types;
 
 use clap::{Parser, Subcommand};
@@ -22,14 +23,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the daemon and mount the filesystem
+    /// Start the daemon in the foreground (used by service managers)
     Daemon,
 
-    /// Stop the running daemon
-    Stop {
-        /// Kill processes with files open under the mount before stopping
-        #[arg(short, long)]
-        force: bool,
+    /// Manage the background service
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
 
     /// Show daemon status
@@ -77,6 +77,38 @@ enum Commands {
     Doctor,
 }
 
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install and start the daemon as a system service
+    Install {
+        /// Install but don't start immediately
+        #[arg(long)]
+        no_start: bool,
+    },
+
+    /// Stop and remove the daemon service
+    Uninstall,
+
+    /// Start the installed service
+    Start,
+
+    /// Stop the installed service
+    Stop {
+        /// Kill processes with files open under the mount before stopping
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Restart the installed service (picks up new binary after update)
+    Restart,
+
+    /// Show service status
+    Status,
+
+    /// Tail daemon logs
+    Logs,
+}
+
 fn main() {
     env_logger::init();
 
@@ -84,7 +116,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Daemon => cmd_daemon(),
-        Commands::Stop { force } => cmd_stop(force),
+        Commands::Service { action } => cmd_service(action),
         Commands::Status => cmd_status(),
         Commands::Tui => cmd_tui(),
         Commands::Sync { repo } => cmd_sync(&repo),
@@ -100,7 +132,7 @@ fn main() {
         eprintln!("Error: {}", e);
         if let Some(ClientError::NotRunning) = e.downcast_ref::<ClientError>() {
             eprintln!();
-            eprintln!("Hint: Start the daemon with: ghfs daemon");
+            eprintln!("Hint: Start the daemon with: ghfs service start");
         }
         std::process::exit(1);
     }
@@ -111,68 +143,18 @@ fn cmd_daemon() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_stop(force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if force {
-        // Find processes with files open under the mount and kill them
-        let mount_point = daemon::mount_point();
-        let pids = find_open_file_pids(mount_point.to_string_lossy().as_ref());
-        if !pids.is_empty() {
-            println!("Killing {} process(es) with open files...", pids.len());
-            for pid in &pids {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .status();
-            }
-            // Give processes time to die
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+fn cmd_service(action: ServiceAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        ServiceAction::Install { no_start } => service::install(no_start)?,
+        ServiceAction::Uninstall => service::uninstall()?,
+        ServiceAction::Start => service::start()?,
+        ServiceAction::Stop { force } => service::stop(force)?,
+        ServiceAction::Restart => service::restart()?,
+        ServiceAction::Status => service::status()?,
+        ServiceAction::Logs => service::logs()?,
     }
 
-    let mut client = Client::connect()?;
-    client.stop()?;
-    println!("Daemon stopped");
     Ok(())
-}
-
-/// Find PIDs of processes with files open under the given path.
-fn find_open_file_pids(target_path: &str) -> Vec<u32> {
-    use std::fs;
-
-    let mut pids = Vec::new();
-
-    let Ok(proc_dir) = fs::read_dir("/proc") else {
-        return pids;
-    };
-
-    for entry in proc_dir.flatten() {
-        let pid_str = entry.file_name();
-        let pid_str = pid_str.to_string_lossy();
-
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-
-        // Skip our own process
-        if pid == std::process::id() {
-            continue;
-        }
-
-        let fd_dir = format!("/proc/{}/fd", pid);
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            continue;
-        };
-
-        for fd_entry in fds.flatten() {
-            if let Ok(link_target) = fs::read_link(fd_entry.path()) {
-                if link_target.to_string_lossy().starts_with(target_path) {
-                    pids.push(pid);
-                    break;
-                }
-            }
-        }
-    }
-
-    pids
 }
 
 fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
@@ -405,6 +387,25 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
             "not running"
         }
     );
+
+    match service::installation_status() {
+        Ok(install) if install.installed => {
+            println!(
+                "[OK] Service: installed ({})",
+                install.backend.installed_kind()
+            );
+        }
+        Ok(_) => {
+            println!("[INFO] Service: not installed (run 'ghfs service install')");
+        }
+        Err(service::ServiceError::UnsupportedPlatform)
+        | Err(service::ServiceError::BackendUnavailable(_)) => {
+            println!("[INFO] Service: unsupported on this platform");
+        }
+        Err(err) => {
+            println!("[INFO] Service: check failed ({})", err);
+        }
+    }
 
     // Check mount point
     let mount_point = daemon::mount_point();

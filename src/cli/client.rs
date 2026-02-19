@@ -3,8 +3,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::protocol::{
-    ListResult, Request, Response, RpcError, RpcRequest, StatusResult, SyncResult, read_response,
-    write_message,
+    ListResult, Request, Response, RpcError, RpcRequest, StatusResult, SyncResult, VersionResult,
+    read_response, write_message,
 };
 
 /// Get the socket path
@@ -174,6 +174,14 @@ impl Client {
     pub fn list(&mut self) -> Result<ListResult, ClientError> {
         match self.call(Request::List)? {
             Response::List(l) => Ok(l),
+            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Convenience: daemon version
+    pub fn version(&mut self) -> Result<VersionResult, ClientError> {
+        match self.call(Request::Version)? {
+            Response::Version(v) => Ok(v),
             other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
         }
     }

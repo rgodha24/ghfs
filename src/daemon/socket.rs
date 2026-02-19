@@ -13,7 +13,7 @@ use crate::daemon::state::State;
 use crate::daemon::worker::WorkerHandle;
 use crate::protocol::{
     ListResult, RepoInfo, Request, Response, RpcError, RpcErrorResponse, RpcResponse, StatusResult,
-    SyncResult, read_request, write_message,
+    SyncResult, VersionResult, read_request, write_message,
 };
 use crate::types::RepoKey;
 
@@ -173,6 +173,11 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
 
             Ok(Response::List(ListResult { repos: infos }))
         }
+
+        Request::Version => Ok(Response::Version(VersionResult {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+        })),
 
         Request::Stop => {
             // Trigger unmount to unblock the filesystem backend loop.
