@@ -18,17 +18,15 @@ in {
       wantedBy = ["multi-user.target"];
       after = ["network-online.target"];
       wants = ["network-online.target"];
-      path = [
-        cfg.package
-        pkgs.git
-        pkgs.fuse3
-      ];
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/ghfs daemon";
         Restart = "on-failure";
         RestartSec = 5;
-        Environment = "RUST_LOG=info";
+        Environment = [
+          "RUST_LOG=info"
+          "PATH=/run/wrappers/bin:${lib.makeBinPath [ cfg.package pkgs.git pkgs.fuse3 ]}:/usr/bin:/bin:/usr/sbin:/sbin"
+        ];
       };
     };
 

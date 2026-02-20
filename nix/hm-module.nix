@@ -35,7 +35,7 @@ in {
           RestartSec = 5;
           Environment = [
             "RUST_LOG=info"
-            "PATH=${lib.makeBinPath [ cfg.package pkgs.git pkgs.fuse3 ]}:/usr/bin:/bin:/usr/sbin:/sbin"
+            "PATH=/run/wrappers/bin:${lib.makeBinPath [ cfg.package pkgs.git pkgs.fuse3 ]}:/usr/bin:/bin:/usr/sbin:/sbin"
           ];
         };
         Install = {
