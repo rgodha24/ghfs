@@ -113,6 +113,62 @@ pub(crate) fn spawn_unmount(mount_point: String) {
     });
 }
 
+#[cfg(target_os = "linux")]
+fn try_unmount_linux(mount_point: &str) -> bool {
+    if std::process::Command::new("fusermount3")
+        .args(["-u", mount_point])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if std::process::Command::new("fusermount")
+        .args(["-u", mount_point])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    std::process::Command::new("umount")
+        .args(["-l", mount_point])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn ensure_mount_point_ready(mount_point: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(err) = std::fs::read_dir(mount_point) {
+            if err.raw_os_error() == Some(libc::ENOTCONN) {
+                log::warn!(
+                    "Mount point {} appears disconnected; attempting cleanup",
+                    mount_point.display()
+                );
+
+                let mount_point_str = mount_point.to_string_lossy();
+                let cleaned = try_unmount_linux(&mount_point_str);
+                if !cleaned {
+                    log::warn!(
+                        "Failed to unmount disconnected mount at {}",
+                        mount_point.display()
+                    );
+                }
+            }
+        }
+    }
+
+    match std::fs::create_dir_all(mount_point) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 impl Daemon {
     /// Create a new daemon instance.
     pub fn new() -> Result<Self, DaemonError> {
@@ -145,10 +201,8 @@ impl Daemon {
         log::info!("Cache: {}", self.cache_paths.root().display());
         log::info!("Socket: {}", socket_path().display());
 
-        // Ensure mount point exists.
-        if !self.mount_point.exists() {
-            std::fs::create_dir_all(&self.mount_point)?;
-        }
+        // Ensure mount point exists and recover from disconnected stale mounts.
+        ensure_mount_point_ready(&self.mount_point)?;
 
         // Create managed cache for the worker
         let managed_cache = ManagedCache::new(self.cache_paths.clone(), Arc::clone(&self.state));
