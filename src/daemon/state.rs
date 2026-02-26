@@ -1,6 +1,6 @@
 //! SQLite-based state persistence for tracking repos, sync state, and priorities.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, params_from_iter};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -347,6 +347,42 @@ impl State {
         Ok(())
     }
 
+    /// Delete generation rows for a repo, keeping only the specified generation numbers.
+    pub fn delete_generations_except(
+        &self,
+        key: &RepoKey,
+        keep_generations: &[u64],
+    ) -> Result<(), rusqlite::Error> {
+        let repo_id = self.get_or_create_repo_id(key)?;
+        let conn = self.conn.lock().unwrap();
+
+        if keep_generations.is_empty() {
+            conn.execute(
+                "DELETE FROM generations WHERE repo_id = ?1",
+                params![repo_id],
+            )?;
+            return Ok(());
+        }
+
+        let placeholders = (0..keep_generations.len())
+            .map(|idx| format!("?{}", idx + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM generations WHERE repo_id = ?1 AND generation NOT IN ({})",
+            placeholders
+        );
+
+        let mut values = Vec::with_capacity(1 + keep_generations.len());
+        values.push(rusqlite::types::Value::Integer(repo_id));
+        for generation in keep_generations {
+            values.push(rusqlite::types::Value::Integer(*generation as i64));
+        }
+
+        conn.execute(&sql, params_from_iter(values))?;
+        Ok(())
+    }
+
     /// Update the stored mirror size for a repo.
     pub fn update_mirror_size(
         &self,
@@ -558,5 +594,65 @@ mod tests {
         let repos = state.list_repos().unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].owner, "real");
+    }
+
+    #[test]
+    fn test_delete_generations_except() {
+        let (state, _dir) = create_test_state();
+        let key = make_repo_key("octocat", "hello-world");
+
+        state.get_or_create_repo(&key).unwrap();
+        state.upsert_generation(&key, 1, "commit1", 100).unwrap();
+        state.upsert_generation(&key, 2, "commit2", 200).unwrap();
+        state.upsert_generation(&key, 3, "commit3", 300).unwrap();
+
+        state.delete_generations_except(&key, &[2]).unwrap();
+
+        let conn = state.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generations g
+                 JOIN repos r ON r.id = g.repo_id
+                 WHERE r.owner = ?1 AND r.repo = ?2",
+                params!["octocat", "hello-world"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let generation: i64 = conn
+            .query_row(
+                "SELECT g.generation FROM generations g
+                 JOIN repos r ON r.id = g.repo_id
+                 WHERE r.owner = ?1 AND r.repo = ?2",
+                params!["octocat", "hello-world"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+    }
+
+    #[test]
+    fn test_delete_generations_except_empty_keeps_none() {
+        let (state, _dir) = create_test_state();
+        let key = make_repo_key("octocat", "hello-world");
+
+        state.get_or_create_repo(&key).unwrap();
+        state.upsert_generation(&key, 1, "commit1", 100).unwrap();
+        state.upsert_generation(&key, 2, "commit2", 200).unwrap();
+
+        state.delete_generations_except(&key, &[]).unwrap();
+
+        let conn = state.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generations g
+                 JOIN repos r ON r.id = g.repo_id
+                 WHERE r.owner = ?1 AND r.repo = ?2",
+                params!["octocat", "hello-world"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

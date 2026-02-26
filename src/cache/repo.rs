@@ -5,8 +5,9 @@
 //! and symlink swapping.
 
 use super::git::{is_shallow_repo, open_repository, resolve_default_branch};
-use super::{CachePaths, GitCli, RepoLock, atomic_symlink_swap, is_stale};
+use super::{CachePaths, GitCli, RepoLock, atomic_symlink_swap, is_stale, touch_symlink};
 use crate::types::{GenerationId, RepoKey};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -75,6 +76,17 @@ fn cleanup_worktree(path: &Path) {
     if std::fs::remove_dir_all(path).is_err() {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Keep one previous generation as a short grace window.
+///
+/// This reduces transient lookup/open races right after a generation swap while
+/// still bounding disk usage to ~2 materialized worktrees per repo.
+const PREVIOUS_GENERATION_GRACE_COUNT: usize = 1;
+
+fn parse_generation_number(name: &str) -> Option<u64> {
+    name.strip_prefix("gen-")
+        .and_then(|num| num.parse::<u64>().ok())
 }
 
 impl RepoCache {
@@ -227,13 +239,17 @@ impl RepoCache {
             return Err(err.into());
         }
 
+        self.prune_generations(key, &[generation.as_u64()]);
+
         Ok(())
     }
 
     fn refresh(&self, key: &RepoKey) -> Result<(), CacheError> {
         let mirror_path = self.paths.mirror_dir(key);
         let repo = open_repository(&mirror_path)?;
-        let (branch, _old_commit) = resolve_default_branch(&repo)?;
+        let (branch, old_commit) = resolve_default_branch(&repo)?;
+        let current_link = self.paths.current_symlink(key);
+        let previous_generation = self.current_generation_number(key);
 
         // Use full fetch if repo is not shallow, otherwise shallow fetch
         let is_shallow = is_shallow_repo(&mirror_path).unwrap_or(true);
@@ -245,6 +261,25 @@ impl RepoCache {
 
         let repo = open_repository(&mirror_path)?;
         let (_branch, commit) = resolve_default_branch(&repo)?;
+
+        // If HEAD is unchanged and we still have a materialized current target,
+        // refresh staleness metadata and skip creating a duplicate generation.
+        if commit == old_commit && current_link.exists() {
+            if let Err(err) = touch_symlink(&current_link) {
+                log::warn!(
+                    "Failed to refresh staleness timestamp for {}: {}",
+                    current_link.display(),
+                    err
+                );
+            }
+
+            if let Some(current_generation) = self.current_generation_number(key) {
+                let keep = self.keep_generations_with_grace(key, current_generation);
+                self.prune_generations(key, &keep);
+            }
+
+            return Ok(());
+        }
 
         let next_gen = self.next_generation(key);
         let gen_path = self.paths.generation_dir(key, next_gen);
@@ -260,7 +295,91 @@ impl RepoCache {
             return Err(err.into());
         }
 
+        let mut keep = vec![next_gen.as_u64()];
+        if let Some(previous) = previous_generation {
+            if previous != next_gen.as_u64() {
+                keep.push(previous);
+            }
+        }
+        self.prune_generations(key, &keep);
+
         Ok(())
+    }
+
+    fn keep_generations_with_grace(&self, key: &RepoKey, current: u64) -> Vec<u64> {
+        let mut keep = vec![current];
+
+        if PREVIOUS_GENERATION_GRACE_COUNT > 0 {
+            let mut others: Vec<u64> = self
+                .list_generation_numbers(key)
+                .into_iter()
+                .filter(|generation| *generation != current)
+                .collect();
+            others.sort_unstable_by(|a, b| b.cmp(a));
+            keep.extend(others.into_iter().take(PREVIOUS_GENERATION_GRACE_COUNT));
+        }
+
+        keep
+    }
+
+    fn list_generation_numbers(&self, key: &RepoKey) -> Vec<u64> {
+        let base = self.paths.worktree_base(key);
+        let mut generations = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+
+                if let Some(name) = entry.file_name().to_str()
+                    && let Some(num) = parse_generation_number(name)
+                {
+                    generations.push(num);
+                }
+            }
+        }
+
+        generations
+    }
+
+    fn current_generation_number(&self, key: &RepoKey) -> Option<u64> {
+        let current_link = self.paths.current_symlink(key);
+        let target = std::fs::read_link(&current_link).ok()?;
+        let target = resolve_symlink_target(&current_link, target);
+        let name = target.file_name()?.to_str()?;
+        parse_generation_number(name)
+    }
+
+    fn prune_generations(&self, key: &RepoKey, keep_generations: &[u64]) {
+        let keep: HashSet<u64> = keep_generations.iter().copied().collect();
+        let base = self.paths.worktree_base(key);
+
+        let entries = match std::fs::read_dir(base) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            let Some(generation) = parse_generation_number(&name) else {
+                continue;
+            };
+
+            if keep.contains(&generation) {
+                continue;
+            }
+
+            let path = entry.path();
+            log::debug!("Pruning generation {} for {}", generation, key);
+            cleanup_worktree(&path);
+        }
     }
 
     /// Unshallow a repository: fetch full history for the default branch.
@@ -387,20 +506,11 @@ impl RepoCache {
 
     fn next_generation(&self, key: &RepoKey) -> GenerationId {
         // Find highest existing generation and increment
-        let base = self.paths.worktree_base(key);
-        let mut max = 0u64;
-
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Some(num_str) = name.strip_prefix("gen-") {
-                        if let Ok(num) = num_str.parse::<u64>() {
-                            max = max.max(num);
-                        }
-                    }
-                }
-            }
-        }
+        let max = self
+            .list_generation_numbers(key)
+            .into_iter()
+            .max()
+            .unwrap_or(0);
 
         GenerationId::new(max + 1)
     }
@@ -631,17 +741,40 @@ mod tests {
         let result2 = cache.ensure_current(&key);
         assert!(result2.is_ok());
         let gen_ref2 = result2.unwrap();
-        assert_eq!(gen_ref2.generation.as_u64(), 2);
-        let gen1_path = paths.generation_dir(&key, GenerationId::new(1));
-        let gen2_path = paths.generation_dir(&key, GenerationId::new(2));
-        assert!(gen1_path.exists());
-        assert!(gen2_path.exists());
+
+        // Refresh may or may not create a new generation depending on whether
+        // remote HEAD changed.
+        assert!(gen_ref2.generation.as_u64() >= gen_ref1.generation.as_u64());
+        let current_gen = gen_ref2.generation.as_u64();
+        let current_path = paths.generation_dir(&key, GenerationId::new(current_gen));
+        assert!(current_path.exists());
+
+        // We keep at most current + one grace generation.
+        let worktree_base = paths.worktree_base(&key);
+        let gen_dirs: Vec<_> = fs::read_dir(&worktree_base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && e.file_name()
+                        .to_str()
+                        .is_some_and(|s| s.starts_with("gen-"))
+            })
+            .collect();
+        assert!(
+            gen_dirs.len() <= 2,
+            "Expected <= 2 generation dirs, found {}",
+            gen_dirs.len()
+        );
+
         let current_link = paths.current_symlink(&key);
         let target = fs::read_link(&current_link).unwrap();
+        let expected = format!("gen-{:0>6}", current_gen);
         assert!(
-            target.to_str().unwrap().contains("gen-000002"),
-            "Expected target to contain 'gen-000002', got: {:?}",
-            target
+            target.to_str().unwrap().contains(&expected),
+            "Expected target to contain '{}', got: {:?}",
+            expected,
+            target,
         );
     }
 
