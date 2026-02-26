@@ -186,6 +186,21 @@ impl State {
         Ok(())
     }
 
+    /// Clear sync metadata for a repository.
+    pub fn clear_sync(&self, key: &RepoKey) -> Result<(), rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+        let conn = self.conn.lock().unwrap();
+
+        conn.execute(
+            "UPDATE repos
+             SET current_generation = NULL, head_commit = NULL, last_sync_at = NULL
+             WHERE owner = ?1 AND repo = ?2",
+            params![owner, repo],
+        )?;
+        Ok(())
+    }
+
     /// Record an access time for GC decisions.
     pub fn touch_access(&self, key: &RepoKey) -> Result<(), rusqlite::Error> {
         let owner = key.owner.as_str();
@@ -498,6 +513,22 @@ mod tests {
         let now = now_unix();
         let sync_time = repo.last_sync_at.unwrap();
         assert!(now - sync_time < 5);
+    }
+
+    #[test]
+    fn test_clear_sync() {
+        let (state, _dir) = create_test_state();
+        let key = make_repo_key("rust-lang", "rust");
+
+        state.get_or_create_repo(&key).unwrap();
+        state.update_sync(&key, 42, "abc123def456").unwrap();
+
+        state.clear_sync(&key).unwrap();
+
+        let repo = state.get_or_create_repo(&key).unwrap();
+        assert!(repo.current_generation.is_none());
+        assert!(repo.head_commit.is_none());
+        assert!(repo.last_sync_at.is_none());
     }
 
     #[test]

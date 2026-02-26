@@ -1,6 +1,7 @@
 //! Daemon module for background sync operations.
 
 mod backfill;
+mod gc;
 mod scheduler;
 mod socket;
 pub mod state;

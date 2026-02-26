@@ -24,6 +24,9 @@ pub enum Request {
     #[serde(rename = "reshallow")]
     ReshallowRepo { repo: String },
 
+    /// Run cache metadata garbage collection
+    Gc,
+
     /// List all known repos
     List,
 
@@ -52,6 +55,14 @@ pub struct StatusResult {
 pub struct SyncResult {
     pub generation: u64,
     pub commit: String,
+}
+
+/// GC response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcResult {
+    pub repos_scanned: u64,
+    pub repos_removed: u64,
+    pub sync_resets: u64,
 }
 
 /// Single repo info for list
@@ -94,6 +105,7 @@ pub struct VersionResult {
 pub enum Response {
     Status(StatusResult),
     Sync(SyncResult),
+    Gc(GcResult),
     List(ListResult),
     Version(VersionResult),
     Ok(()), // For watch/unwatch/stop - unit type serializes as null
@@ -161,6 +173,15 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
 
         assert!(json.contains(r#""method":"version""#));
+        assert!(!json.contains(r#""params""#));
+    }
+
+    #[test]
+    fn test_serialize_gc_request_without_params() {
+        let req = Request::Gc;
+        let json = serde_json::to_string(&req).unwrap();
+
+        assert!(json.contains(r#""method":"gc""#));
         assert!(!json.contains(r#""params""#));
     }
 

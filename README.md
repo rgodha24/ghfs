@@ -29,6 +29,14 @@ ghfs service status
 ghfs service logs
 ```
 
+Cache maintenance:
+
+```bash
+ghfs gc
+```
+
+`ghfs gc` reconciles daemon state with cache contents and clears stale metadata.
+
 `ghfs service install` is idempotent. Running it again rewrites service config with the current
 binary path and restarts the daemon.
 

@@ -3,8 +3,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::protocol::{
-    ListResult, Request, Response, RpcError, RpcRequest, StatusResult, SyncResult, VersionResult,
-    read_response, write_message,
+    GcResult, ListResult, Request, Response, RpcError, RpcRequest, StatusResult, SyncResult,
+    VersionResult, read_response, write_message,
 };
 
 /// Get the socket path
@@ -166,6 +166,14 @@ impl Client {
             repo: repo.to_string(),
         })? {
             Response::Sync(s) => Ok(s),
+            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Convenience: run cache metadata garbage collection
+    pub fn gc(&mut self) -> Result<GcResult, ClientError> {
+        match self.call(Request::Gc)? {
+            Response::Gc(g) => Ok(g),
             other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
         }
     }

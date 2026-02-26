@@ -83,6 +83,9 @@ enum Commands {
     /// List known repositories
     List,
 
+    /// Garbage collect cache metadata and stale state
+    Gc,
+
     /// Check dependencies
     Doctor,
 }
@@ -135,6 +138,7 @@ fn main() {
         Commands::Unshallow { repo } => cmd_unshallow(&repo),
         Commands::Reshallow { repo } => cmd_reshallow(&repo),
         Commands::List => cmd_list(),
+        Commands::Gc => cmd_gc(),
         Commands::Doctor => cmd_doctor(),
     };
 
@@ -317,6 +321,18 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
             repo_name, priority, generation, last_sync, last_access
         );
     }
+
+    Ok(())
+}
+
+fn cmd_gc() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = Client::connect()?;
+    let result = client.gc()?;
+
+    println!("Garbage collection complete");
+    println!("  Repositories scanned: {}", result.repos_scanned);
+    println!("  Repositories removed: {}", result.repos_removed);
+    println!("  Sync state reset:     {}", result.sync_resets);
 
     Ok(())
 }

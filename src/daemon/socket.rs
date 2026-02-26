@@ -9,11 +9,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::cache::{CachePaths, is_shallow_repo};
+use crate::daemon::gc;
 use crate::daemon::state::State;
 use crate::daemon::worker::WorkerHandle;
 use crate::protocol::{
-    ListResult, RepoInfo, Request, Response, RpcError, RpcErrorResponse, RpcResponse, StatusResult,
-    SyncResult, VersionResult, read_request, write_message,
+    GcResult, ListResult, RepoInfo, Request, Response, RpcError, RpcErrorResponse, RpcResponse,
+    StatusResult, SyncResult, VersionResult, read_request, write_message,
 };
 use crate::types::RepoKey;
 
@@ -131,6 +132,16 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
             Ok(Response::Sync(SyncResult {
                 generation: gen_ref.generation.as_u64(),
                 commit: gen_ref.commit,
+            }))
+        }
+
+        Request::Gc => {
+            let stats = gc::run_gc(&ctx.state, &ctx.cache_paths);
+
+            Ok(Response::Gc(GcResult {
+                repos_scanned: stats.repos_scanned,
+                repos_removed: stats.repos_removed,
+                sync_resets: stats.sync_resets,
             }))
         }
 
