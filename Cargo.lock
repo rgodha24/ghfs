@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "ghfs"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "clap",

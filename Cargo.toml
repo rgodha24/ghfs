@@ -1,6 +1,6 @@
 [package]
 name = "ghfs"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Mount GitHub repositories as a local filesystem"
 license = "MIT"
