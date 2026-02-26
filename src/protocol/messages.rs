@@ -10,20 +10,6 @@ pub enum Request {
     /// Force sync a repo
     Sync { repo: String },
 
-    /// Watch a repo (increase priority)
-    Watch { repo: String },
-
-    /// Unwatch a repo (reset priority)
-    Unwatch { repo: String },
-
-    /// Unshallow a repo (fetch full history)
-    #[serde(rename = "unshallow")]
-    UnshallowRepo { repo: String },
-
-    /// Reshallow a repo (convert back to depth=1)
-    #[serde(rename = "reshallow")]
-    ReshallowRepo { repo: String },
-
     /// Run cache metadata garbage collection
     Gc,
 
@@ -70,7 +56,6 @@ pub struct GcResult {
 pub struct RepoInfo {
     pub owner: String,
     pub repo: String,
-    pub priority: i32,
     pub generation: Option<u64>,
     pub commit: Option<String>,
     pub last_sync: Option<String>,   // Human-readable timestamp
@@ -81,9 +66,6 @@ pub struct RepoInfo {
     pub commit_count: u64,
     #[serde(default)]
     pub total_size_bytes: u64,
-    /// Whether the mirror is a shallow clone (None if mirror doesn't exist)
-    #[serde(default)]
-    pub shallow: Option<bool>,
 }
 
 /// List response
@@ -108,7 +90,7 @@ pub enum Response {
     Gc(GcResult),
     List(ListResult),
     Version(VersionResult),
-    Ok(()), // For watch/unwatch/stop - unit type serializes as null
+    Ok(()), // For stop - unit type serializes as null
 }
 
 /// RPC error

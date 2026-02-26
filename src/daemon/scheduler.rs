@@ -20,9 +20,6 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
 /// Max age before a repo is considered stale.
 const MAX_AGE_SECS: i64 = 24 * 60 * 60; // 24 hours
 
-/// Max age for watched (priority > 0) repos.
-const WATCHED_MAX_AGE_SECS: i64 = 1 * 60 * 60; // 1 hour
-
 /// Background scheduler that periodically checks for stale repos.
 pub struct Scheduler {
     state: Arc<State>,
@@ -85,16 +82,9 @@ impl Scheduler {
             .as_secs() as i64;
 
         for repo in repos {
-            // Determine max age based on priority
-            let max_age = if repo.priority > 0 {
-                WATCHED_MAX_AGE_SECS
-            } else {
-                MAX_AGE_SECS
-            };
-
             // Check if stale
             let is_stale = match repo.last_sync_at {
-                Some(ts) => now - ts > max_age,
+                Some(ts) => now - ts > MAX_AGE_SECS,
                 None => true, // Never synced
             };
 

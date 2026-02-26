@@ -44,7 +44,7 @@ impl NegativeCache {
     }
 
     /// Create a new negative cache with a custom TTL.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             entries: DashMap::new(),
@@ -97,24 +97,6 @@ impl NegativeCache {
                 false
             }
         }
-    }
-
-    /// Remove a repo from the negative cache (e.g., if it was successfully cloned).
-    #[allow(dead_code)]
-    pub fn remove(&self, key: &RepoKey) {
-        self.entries.remove(key);
-    }
-
-    /// Get the number of entries in the cache (for debugging/stats).
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if the cache is empty.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 

@@ -4,8 +4,11 @@
 //! that ties together all cache operations: cloning, fetching, worktree management,
 //! and symlink swapping.
 
-use super::git::{is_shallow_repo, open_repository, resolve_default_branch};
-use super::{CachePaths, GitCli, RepoLock, atomic_symlink_swap, is_stale, touch_symlink};
+use super::CachePaths;
+use super::git::{GitCli, open_repository, resolve_default_branch};
+use super::lock::RepoLock;
+use super::staleness::{is_stale, touch_symlink};
+use super::swap::atomic_symlink_swap;
 use crate::types::{GenerationId, RepoKey};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -100,6 +103,7 @@ impl RepoCache {
     }
 
     /// Set the maximum age for cached generations before refresh.
+    #[cfg(test)]
     pub fn with_max_age(mut self, max_age: Duration) -> Self {
         self.max_age = max_age;
         self
@@ -144,6 +148,7 @@ impl RepoCache {
     /// 1. Clone if not present
     /// 2. Refresh if stale
     /// 3. Return existing if fresh
+    #[cfg(test)]
     pub fn ensure_current(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
         self.ensure_current_with_status(key)
             .map(|result| result.gen_ref)
@@ -251,13 +256,7 @@ impl RepoCache {
         let current_link = self.paths.current_symlink(key);
         let previous_generation = self.current_generation_number(key);
 
-        // Use full fetch if repo is not shallow, otherwise shallow fetch
-        let is_shallow = is_shallow_repo(&mirror_path).unwrap_or(true);
-        if is_shallow {
-            self.git.fetch_shallow(&mirror_path, &branch)?;
-        } else {
-            self.git.fetch_full(&mirror_path, &branch)?;
-        }
+        self.git.fetch_shallow(&mirror_path, &branch)?;
 
         let repo = open_repository(&mirror_path)?;
         let (_branch, commit) = resolve_default_branch(&repo)?;
@@ -380,128 +379,6 @@ impl RepoCache {
             log::debug!("Pruning generation {} for {}", generation, key);
             cleanup_worktree(&path);
         }
-    }
-
-    /// Unshallow a repository: fetch full history for the default branch.
-    ///
-    /// If the mirror doesn't exist, performs a full clone.
-    /// If already not shallow, performs a normal full fetch.
-    /// Creates a new generation only if no current generation exists.
-    pub fn unshallow(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
-        let lock_path = self.paths.lock_path(key);
-        let _lock = match RepoLock::acquire(&lock_path) {
-            Ok(lock) => lock,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(CacheError::LockFailed);
-            }
-            Err(e) => return Err(CacheError::Io(e)),
-        };
-
-        let mirror_path = self.paths.mirror_dir(key);
-
-        if !mirror_path.exists() {
-            // Clone with full history
-            if let Err(err) =
-                self.git
-                    .clone_bare_full(key.owner.as_str(), key.repo.as_str(), &mirror_path)
-            {
-                let _ = std::fs::remove_dir_all(&mirror_path);
-                return Err(err.into());
-            }
-        } else {
-            // Unshallow if needed, then fetch full
-            let repo = open_repository(&mirror_path)?;
-            let (branch, _) = resolve_default_branch(&repo)?;
-
-            let is_shallow = is_shallow_repo(&mirror_path).unwrap_or(false);
-            if is_shallow {
-                self.git.fetch_unshallow(&mirror_path, &branch)?;
-            } else {
-                self.git.fetch_full(&mirror_path, &branch)?;
-            }
-        }
-
-        // Ensure we have a current generation
-        let current_link = self.paths.current_symlink(key);
-        if !current_link.exists() {
-            let repo = open_repository(&mirror_path)?;
-            let (_, commit) = resolve_default_branch(&repo)?;
-
-            let generation = self.next_generation(key);
-            let gen_path = self.paths.generation_dir(key, generation);
-            if let Err(err) = self.git.create_worktree(&mirror_path, &gen_path, &commit) {
-                cleanup_worktree(&gen_path);
-                return Err(err.into());
-            }
-
-            if let Err(err) = atomic_symlink_swap(&current_link, &gen_path) {
-                cleanup_worktree(&gen_path);
-                return Err(err.into());
-            }
-        }
-
-        self.read_current_ref(key)
-    }
-
-    /// Reshallow a repository: convert back to depth=1 and run gc.
-    ///
-    /// If the mirror doesn't exist, performs a shallow clone.
-    /// If already shallow, performs a normal shallow fetch.
-    /// Creates a new generation only if no current generation exists.
-    pub fn reshallow(&self, key: &RepoKey) -> Result<GenerationRef, CacheError> {
-        let lock_path = self.paths.lock_path(key);
-        let _lock = match RepoLock::acquire(&lock_path) {
-            Ok(lock) => lock,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(CacheError::LockFailed);
-            }
-            Err(e) => return Err(CacheError::Io(e)),
-        };
-
-        let mirror_path = self.paths.mirror_dir(key);
-
-        if !mirror_path.exists() {
-            // Clone shallow
-            if let Err(err) =
-                self.git
-                    .clone_bare_shallow(key.owner.as_str(), key.repo.as_str(), &mirror_path)
-            {
-                let _ = std::fs::remove_dir_all(&mirror_path);
-                return Err(err.into());
-            }
-        } else {
-            // Reshallow if needed
-            let repo = open_repository(&mirror_path)?;
-            let (branch, _) = resolve_default_branch(&repo)?;
-
-            let is_shallow = is_shallow_repo(&mirror_path).unwrap_or(true);
-            if is_shallow {
-                self.git.fetch_shallow(&mirror_path, &branch)?;
-            } else {
-                self.git.fetch_reshallow(&mirror_path, &branch)?;
-            }
-        }
-
-        // Ensure we have a current generation
-        let current_link = self.paths.current_symlink(key);
-        if !current_link.exists() {
-            let repo = open_repository(&mirror_path)?;
-            let (_, commit) = resolve_default_branch(&repo)?;
-
-            let generation = self.next_generation(key);
-            let gen_path = self.paths.generation_dir(key, generation);
-            if let Err(err) = self.git.create_worktree(&mirror_path, &gen_path, &commit) {
-                cleanup_worktree(&gen_path);
-                return Err(err.into());
-            }
-
-            if let Err(err) = atomic_symlink_swap(&current_link, &gen_path) {
-                cleanup_worktree(&gen_path);
-                return Err(err.into());
-            }
-        }
-
-        self.read_current_ref(key)
     }
 
     fn next_generation(&self, key: &RepoKey) -> GenerationId {

@@ -78,7 +78,7 @@ pub fn run_gc(state: &State, cache_paths: &CachePaths) -> GcStats {
             }
         }
 
-        if repo.priority <= 0 && !worktree_base.exists() && !mirror_path.exists() {
+        if !worktree_base.exists() && !mirror_path.exists() {
             if let Err(err) = state.delete_repo(&key) {
                 log::warn!(
                     "gc: failed to remove orphaned repo row for {}: {}",
@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_removes_unwatched_repo_rows_when_cache_missing() {
+    fn gc_removes_repo_rows_when_cache_missing() {
         let (state, cache_paths, _dir) = create_test_env();
         let key: RepoKey = "octocat/hello-world".parse().unwrap();
 
@@ -232,25 +232,19 @@ mod tests {
     }
 
     #[test]
-    fn gc_keeps_watched_repo_rows_and_clears_stale_sync() {
+    fn gc_clears_stale_sync_metadata() {
         let (state, cache_paths, _dir) = create_test_env();
         let key: RepoKey = "rust-lang/rust".parse().unwrap();
 
         state.get_or_create_repo(&key).unwrap();
         state.update_sync(&key, 42, "abc123").unwrap();
-        state.set_priority(&key, 10).unwrap();
-
         let stats = run_gc(&state, &cache_paths);
 
         assert_eq!(stats.repos_scanned, 1);
-        assert_eq!(stats.repos_removed, 0);
+        assert_eq!(stats.repos_removed, 1);
         assert_eq!(stats.sync_resets, 1);
 
         let repos = state.list_repos().unwrap();
-        assert_eq!(repos.len(), 1);
-        assert_eq!(repos[0].priority, 10);
-        assert!(repos[0].current_generation.is_none());
-        assert!(repos[0].head_commit.is_none());
-        assert!(repos[0].last_sync_at.is_none());
+        assert!(repos.is_empty());
     }
 }

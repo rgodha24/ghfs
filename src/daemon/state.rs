@@ -1,4 +1,4 @@
-//! SQLite-based state persistence for tracking repos, sync state, and priorities.
+//! SQLite-based state persistence for tracking repos and sync state.
 
 use rusqlite::{Connection, params, params_from_iter};
 use std::path::Path;
@@ -31,7 +31,6 @@ pub struct RepoState {
     pub id: i64,
     pub owner: String,
     pub repo: String,
-    pub priority: i32,
     pub current_generation: Option<u64>,
     pub head_commit: Option<String>,
     pub last_access_at: Option<i64>,
@@ -43,7 +42,6 @@ pub struct RepoState {
 pub struct RepoStats {
     pub owner: String,
     pub repo: String,
-    pub priority: i32,
     pub current_generation: Option<u64>,
     pub head_commit: Option<String>,
     pub last_access_at: Option<i64>,
@@ -72,7 +70,6 @@ impl State {
                 id INTEGER PRIMARY KEY,
                 owner TEXT NOT NULL,
                 repo TEXT NOT NULL,
-                priority INTEGER DEFAULT 0,
                 current_generation INTEGER,
                 head_commit TEXT,
                 last_access_at INTEGER,
@@ -93,7 +90,6 @@ impl State {
             );
 
             CREATE INDEX IF NOT EXISTS idx_repos_sync ON repos(last_sync_at);
-            CREATE INDEX IF NOT EXISTS idx_repos_priority ON repos(priority DESC, last_sync_at);
             CREATE INDEX IF NOT EXISTS idx_generations_repo ON generations(repo_id);
             ",
         )?;
@@ -134,7 +130,7 @@ impl State {
 
         // Select the record
         conn.query_row(
-            "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
+            "SELECT id, owner, repo, current_generation, head_commit, last_access_at, last_sync_at
              FROM repos WHERE owner = ?1 AND repo = ?2",
             params![owner, repo],
             |row| {
@@ -142,11 +138,10 @@ impl State {
                     id: row.get(0)?,
                     owner: row.get(1)?,
                     repo: row.get(2)?,
-                    priority: row.get(3)?,
-                    current_generation: i64_to_u64_opt(row.get(4)?),
-                    head_commit: row.get(5)?,
-                    last_access_at: row.get(6)?,
-                    last_sync_at: row.get(7)?,
+                    current_generation: i64_to_u64_opt(row.get(3)?),
+                    head_commit: row.get(4)?,
+                    last_access_at: row.get(5)?,
+                    last_sync_at: row.get(6)?,
                 })
             },
         )
@@ -216,59 +211,14 @@ impl State {
         Ok(())
     }
 
-    /// Set priority for a repo. 0 = normal, higher = more important.
-    pub fn set_priority(&self, key: &RepoKey, priority: i32) -> Result<(), rusqlite::Error> {
-        let owner = key.owner.as_str();
-        let repo = key.repo.as_str();
-        let _ = self.get_or_create_repo_id(key)?;
-        let conn = self.conn.lock().unwrap();
-
-        conn.execute(
-            "UPDATE repos SET priority = ?1 WHERE owner = ?2 AND repo = ?3",
-            params![priority, owner, repo],
-        )?;
-        Ok(())
-    }
-
-    /// Get repos that are stale (last_sync_at older than threshold).
-    ///
-    /// A repo is considered stale if its last_sync_at is NULL or older than
-    /// `now - max_age_secs`.
-    pub fn get_stale_repos(&self, max_age_secs: i64) -> Result<Vec<RepoState>, rusqlite::Error> {
-        let threshold = now_unix() - max_age_secs;
-        let conn = self.conn.lock().unwrap();
-
-        let mut stmt = conn.prepare(
-            "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
-             FROM repos
-             WHERE last_sync_at IS NULL OR last_sync_at < ?1
-             ORDER BY priority DESC, COALESCE(last_sync_at, 0)",
-        )?;
-
-        let rows = stmt.query_map(params![threshold], |row| {
-            Ok(RepoState {
-                id: row.get(0)?,
-                owner: row.get(1)?,
-                repo: row.get(2)?,
-                priority: row.get(3)?,
-                current_generation: i64_to_u64_opt(row.get(4)?),
-                head_commit: row.get(5)?,
-                last_access_at: row.get(6)?,
-                last_sync_at: row.get(7)?,
-            })
-        })?;
-
-        rows.collect()
-    }
-
-    /// Get all repos ordered by priority (descending) then staleness.
+    /// Get all repos ordered by staleness.
     pub fn list_repos(&self) -> Result<Vec<RepoState>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT id, owner, repo, priority, current_generation, head_commit, last_access_at, last_sync_at
+            "SELECT id, owner, repo, current_generation, head_commit, last_access_at, last_sync_at
              FROM repos
-             ORDER BY priority DESC, COALESCE(last_sync_at, 0)",
+             ORDER BY COALESCE(last_sync_at, 0)",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -276,11 +226,10 @@ impl State {
                 id: row.get(0)?,
                 owner: row.get(1)?,
                 repo: row.get(2)?,
-                priority: row.get(3)?,
-                current_generation: i64_to_u64_opt(row.get(4)?),
-                head_commit: row.get(5)?,
-                last_access_at: row.get(6)?,
-                last_sync_at: row.get(7)?,
+                current_generation: i64_to_u64_opt(row.get(3)?),
+                head_commit: row.get(4)?,
+                last_access_at: row.get(5)?,
+                last_sync_at: row.get(6)?,
             })
         })?;
 
@@ -292,7 +241,7 @@ impl State {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT r.owner, r.repo, r.priority, r.current_generation, r.head_commit, r.last_access_at, r.last_sync_at,
+            "SELECT r.owner, r.repo, r.current_generation, r.head_commit, r.last_access_at, r.last_sync_at,
                     COALESCE(g.gen_count, 0) AS gen_count,
                     COALESCE(g.commit_count, 0) AS commit_count,
                     COALESCE(g.total_size, 0) + COALESCE(r.mirror_size_bytes, 0) AS total_size
@@ -305,21 +254,20 @@ impl State {
                  FROM generations
                  GROUP BY repo_id
              ) g ON g.repo_id = r.id
-             ORDER BY r.priority DESC, COALESCE(r.last_sync_at, 0)",
+             ORDER BY COALESCE(r.last_sync_at, 0)",
         )?;
 
         let rows = stmt.query_map([], |row| {
             Ok(RepoStats {
                 owner: row.get(0)?,
                 repo: row.get(1)?,
-                priority: row.get(2)?,
-                current_generation: i64_to_u64_opt(row.get(3)?),
-                head_commit: row.get(4)?,
-                last_access_at: row.get(5)?,
-                last_sync_at: row.get(6)?,
-                generation_count: row.get::<_, i64>(7)? as u64,
-                commit_count: row.get::<_, i64>(8)? as u64,
-                total_size_bytes: row.get::<_, i64>(9)? as u64,
+                current_generation: i64_to_u64_opt(row.get(2)?),
+                head_commit: row.get(3)?,
+                last_access_at: row.get(4)?,
+                last_sync_at: row.get(5)?,
+                generation_count: row.get::<_, i64>(6)? as u64,
+                commit_count: row.get::<_, i64>(7)? as u64,
+                total_size_bytes: row.get::<_, i64>(8)? as u64,
             })
         })?;
 
@@ -477,7 +425,6 @@ mod tests {
         let repo1 = state.get_or_create_repo(&key).unwrap();
         assert_eq!(repo1.owner, "octocat");
         assert_eq!(repo1.repo, "hello-world");
-        assert_eq!(repo1.priority, 0);
         assert!(repo1.current_generation.is_none());
         assert!(repo1.head_commit.is_none());
         assert!(repo1.last_access_at.is_none());
@@ -529,68 +476,6 @@ mod tests {
         assert!(repo.current_generation.is_none());
         assert!(repo.head_commit.is_none());
         assert!(repo.last_sync_at.is_none());
-    }
-
-    #[test]
-    fn test_get_stale_repos() {
-        let (state, _dir) = create_test_state();
-
-        // Create two repos
-        let key1 = make_repo_key("org1", "repo1");
-        let key2 = make_repo_key("org2", "repo2");
-
-        state.get_or_create_repo(&key1).unwrap();
-        state.get_or_create_repo(&key2).unwrap();
-
-        // Sync repo1 now
-        state.update_sync(&key1, 1, "commit1").unwrap();
-
-        // Manually set repo2's last_sync_at to 2 hours ago
-        let two_hours_ago = now_unix() - 7200;
-        state
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE repos SET last_sync_at = ?1 WHERE owner = 'org2' AND repo = 'repo2'",
-                params![two_hours_ago],
-            )
-            .unwrap();
-
-        // Get repos stale for more than 1 hour (3600 seconds)
-        let stale = state.get_stale_repos(3600).unwrap();
-        assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].owner, "org2");
-        assert_eq!(stale[0].repo, "repo2");
-
-        // Create a third repo with no sync time (NULL) - should also be stale
-        let key3 = make_repo_key("org3", "repo3");
-        state.get_or_create_repo(&key3).unwrap();
-
-        let stale = state.get_stale_repos(3600).unwrap();
-        assert_eq!(stale.len(), 2);
-    }
-
-    #[test]
-    fn test_priority() {
-        let (state, _dir) = create_test_state();
-        let key = make_repo_key("priority", "test");
-
-        // Create repo with default priority
-        let repo = state.get_or_create_repo(&key).unwrap();
-        assert_eq!(repo.priority, 0);
-
-        // Set high priority
-        state.set_priority(&key, 10).unwrap();
-
-        let repo = state.get_or_create_repo(&key).unwrap();
-        assert_eq!(repo.priority, 10);
-
-        // Set negative priority
-        state.set_priority(&key, -5).unwrap();
-
-        let repo = state.get_or_create_repo(&key).unwrap();
-        assert_eq!(repo.priority, -5);
     }
 
     #[test]

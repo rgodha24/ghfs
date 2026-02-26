@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::cache::{CachePaths, is_shallow_repo};
+use crate::cache::CachePaths;
 use crate::daemon::gc;
 use crate::daemon::state::State;
 use crate::daemon::worker::WorkerHandle;
@@ -76,65 +76,6 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
             }))
         }
 
-        Request::Watch { repo } => {
-            let key: RepoKey = repo
-                .parse()
-                .map_err(|e| RpcError::invalid_params(format!("invalid repo: {}", e)))?;
-
-            ctx.state
-                .get_or_create_repo(&key)
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-            ctx.state
-                .set_priority(&key, 10)
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-
-            Ok(Response::Ok(()))
-        }
-
-        Request::Unwatch { repo } => {
-            let key: RepoKey = repo
-                .parse()
-                .map_err(|e| RpcError::invalid_params(format!("invalid repo: {}", e)))?;
-
-            ctx.state
-                .set_priority(&key, 0)
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-
-            Ok(Response::Ok(()))
-        }
-
-        Request::UnshallowRepo { repo } => {
-            let key: RepoKey = repo
-                .parse()
-                .map_err(|e| RpcError::invalid_params(format!("invalid repo: {}", e)))?;
-
-            let gen_ref = ctx
-                .worker
-                .unshallow(key)
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-
-            Ok(Response::Sync(SyncResult {
-                generation: gen_ref.generation.as_u64(),
-                commit: gen_ref.commit,
-            }))
-        }
-
-        Request::ReshallowRepo { repo } => {
-            let key: RepoKey = repo
-                .parse()
-                .map_err(|e| RpcError::invalid_params(format!("invalid repo: {}", e)))?;
-
-            let gen_ref = ctx
-                .worker
-                .reshallow(key)
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-
-            Ok(Response::Sync(SyncResult {
-                generation: gen_ref.generation.as_u64(),
-                commit: gen_ref.commit,
-            }))
-        }
-
         Request::Gc => {
             let stats = gc::run_gc(&ctx.state, &ctx.cache_paths);
 
@@ -153,32 +94,16 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
 
             let infos: Vec<RepoInfo> = repos
                 .into_iter()
-                .map(|r| {
-                    // Check if mirror exists and is shallow
-                    let key = RepoKey {
-                        owner: r.owner.parse().unwrap(),
-                        repo: r.repo.parse().unwrap(),
-                    };
-                    let mirror_path = ctx.cache_paths.mirror_dir(&key);
-                    let shallow = if mirror_path.exists() {
-                        is_shallow_repo(&mirror_path).ok()
-                    } else {
-                        None
-                    };
-
-                    RepoInfo {
-                        owner: r.owner,
-                        repo: r.repo,
-                        priority: r.priority,
-                        generation: r.current_generation,
-                        commit: r.head_commit,
-                        last_sync: r.last_sync_at.map(format_timestamp),
-                        last_access: r.last_access_at.map(format_timestamp),
-                        generation_count: r.generation_count,
-                        commit_count: r.commit_count,
-                        total_size_bytes: r.total_size_bytes,
-                        shallow,
-                    }
+                .map(|r| RepoInfo {
+                    owner: r.owner,
+                    repo: r.repo,
+                    generation: r.current_generation,
+                    commit: r.head_commit,
+                    last_sync: r.last_sync_at.map(format_timestamp),
+                    last_access: r.last_access_at.map(format_timestamp),
+                    generation_count: r.generation_count,
+                    commit_count: r.commit_count,
+                    total_size_bytes: r.total_size_bytes,
                 })
                 .collect();
 

@@ -67,6 +67,7 @@ impl RepoLock {
 
     /// Try to acquire lock without blocking.
     /// Returns None if lock is held by another process.
+    #[cfg(test)]
     pub fn try_acquire(lock_path: &Path) -> io::Result<Option<Self>> {
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)?;

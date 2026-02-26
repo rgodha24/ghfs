@@ -3,8 +3,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::protocol::{
-    GcResult, ListResult, Request, Response, RpcError, RpcRequest, StatusResult, SyncResult,
-    VersionResult, read_response, write_message,
+    read_response, write_message, GcResult, ListResult, Request, Response, RpcError, RpcRequest,
+    StatusResult, SyncResult, VersionResult,
 };
 
 /// Get the socket path
@@ -130,46 +130,6 @@ impl Client {
         }
     }
 
-    /// Convenience: watch a repo
-    pub fn watch(&mut self, repo: &str) -> Result<(), ClientError> {
-        match self.call(Request::Watch {
-            repo: repo.to_string(),
-        })? {
-            Response::Ok(()) => Ok(()),
-            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
-        }
-    }
-
-    /// Convenience: unwatch a repo
-    pub fn unwatch(&mut self, repo: &str) -> Result<(), ClientError> {
-        match self.call(Request::Unwatch {
-            repo: repo.to_string(),
-        })? {
-            Response::Ok(()) => Ok(()),
-            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
-        }
-    }
-
-    /// Convenience: unshallow a repo (fetch full history)
-    pub fn unshallow(&mut self, repo: &str) -> Result<SyncResult, ClientError> {
-        match self.call(Request::UnshallowRepo {
-            repo: repo.to_string(),
-        })? {
-            Response::Sync(s) => Ok(s),
-            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
-        }
-    }
-
-    /// Convenience: reshallow a repo (convert back to depth=1)
-    pub fn reshallow(&mut self, repo: &str) -> Result<SyncResult, ClientError> {
-        match self.call(Request::ReshallowRepo {
-            repo: repo.to_string(),
-        })? {
-            Response::Sync(s) => Ok(s),
-            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
-        }
-    }
-
     /// Convenience: run cache metadata garbage collection
     pub fn gc(&mut self) -> Result<GcResult, ClientError> {
         match self.call(Request::Gc)? {
@@ -190,14 +150,6 @@ impl Client {
     pub fn version(&mut self) -> Result<VersionResult, ClientError> {
         match self.call(Request::Version)? {
             Response::Version(v) => Ok(v),
-            other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
-        }
-    }
-
-    /// Convenience: stop daemon
-    pub fn stop(&mut self) -> Result<(), ClientError> {
-        match self.call(Request::Stop)? {
-            Response::Ok(()) => Ok(()),
             other => Err(ClientError::InvalidResponse(format!("{:?}", other))),
         }
     }

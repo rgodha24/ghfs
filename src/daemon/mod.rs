@@ -9,7 +9,7 @@ mod worker;
 
 pub use scheduler::SchedulerHandle;
 pub use socket::{SocketServerHandle, socket_path};
-pub use state::{RepoState, State};
+pub use state::State;
 pub use worker::{WorkerHandle, WorkerRequest};
 
 use std::path::PathBuf;

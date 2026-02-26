@@ -8,7 +8,7 @@ pub mod types;
 
 use clap::{Parser, Subcommand};
 
-use crate::cli::{Client, ClientError, run_tui};
+use crate::cli::{Client, ClientError};
 use crate::types::RepoKey;
 
 fn command_in_path(name: &str) -> bool {
@@ -45,43 +45,11 @@ enum Commands {
     /// Show daemon status
     Status,
 
-    /// Open interactive TUI
-    Tui,
-
     /// Force sync a repository
     Sync {
         /// Repository in owner/repo format
         repo: String,
     },
-
-    /// Watch a repository (sync more frequently)
-    Watch {
-        /// Repository in owner/repo format
-        repo: String,
-    },
-
-    /// Unwatch a repository
-    Unwatch {
-        /// Repository in owner/repo format
-        repo: String,
-    },
-
-    /// Fetch full git history for a repository
-    #[command(name = "unshallow")]
-    Unshallow {
-        /// Repository in owner/repo format
-        repo: String,
-    },
-
-    /// Convert a repository back to shallow clone (depth=1)
-    #[command(name = "reshallow")]
-    Reshallow {
-        /// Repository in owner/repo format
-        repo: String,
-    },
-
-    /// List known repositories
-    List,
 
     /// Garbage collect cache metadata and stale state
     Gc,
@@ -131,13 +99,7 @@ fn main() {
         Commands::Daemon => cmd_daemon(),
         Commands::Service { action } => cmd_service(action),
         Commands::Status => cmd_status(),
-        Commands::Tui => cmd_tui(),
         Commands::Sync { repo } => cmd_sync(&repo),
-        Commands::Watch { repo } => cmd_watch(&repo),
-        Commands::Unwatch { repo } => cmd_unwatch(&repo),
-        Commands::Unshallow { repo } => cmd_unshallow(&repo),
-        Commands::Reshallow { repo } => cmd_reshallow(&repo),
-        Commands::List => cmd_list(),
         Commands::Gc => cmd_gc(),
         Commands::Doctor => cmd_doctor(),
     };
@@ -175,17 +137,6 @@ fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
     cli::print_status()
 }
 
-fn cmd_tui() -> Result<(), Box<dyn std::error::Error>> {
-    match Client::connect() {
-        Ok(_) => run_tui(),
-        Err(ClientError::NotRunning) => {
-            println!("Daemon is not running");
-            Ok(())
-        }
-        Err(err) => Err(Box::new(err)),
-    }
-}
-
 fn cmd_sync(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Validate repo format first
     let _: RepoKey = repo
@@ -207,120 +158,6 @@ fn cmd_sync(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
             &result.commit
         }
     );
-
-    Ok(())
-}
-
-fn cmd_watch(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let _: RepoKey = repo
-        .parse()
-        .map_err(|e| format!("Invalid repo format: {}", e))?;
-
-    let mut client = Client::connect()?;
-    client.watch(repo)?;
-
-    println!("Watching {}", repo);
-
-    Ok(())
-}
-
-fn cmd_unwatch(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let _: RepoKey = repo
-        .parse()
-        .map_err(|e| format!("Invalid repo format: {}", e))?;
-
-    let mut client = Client::connect()?;
-    client.unwatch(repo)?;
-
-    println!("Unwatched {}", repo);
-
-    Ok(())
-}
-
-fn cmd_unshallow(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let _: RepoKey = repo
-        .parse()
-        .map_err(|e| format!("Invalid repo format: {}", e))?;
-
-    println!("Fetching full history for {}...", repo);
-
-    let mut client = Client::connect()?;
-    let result = client.unshallow(repo)?;
-
-    println!("Unshallowed successfully");
-    println!("  Generation: {}", result.generation);
-    println!(
-        "  Commit:     {}",
-        if result.commit.len() > 12 {
-            &result.commit[..12]
-        } else {
-            &result.commit
-        }
-    );
-
-    Ok(())
-}
-
-fn cmd_reshallow(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let _: RepoKey = repo
-        .parse()
-        .map_err(|e| format!("Invalid repo format: {}", e))?;
-
-    println!("Converting {} to shallow clone...", repo);
-
-    let mut client = Client::connect()?;
-    let result = client.reshallow(repo)?;
-
-    println!("Reshallowed successfully");
-    println!("  Generation: {}", result.generation);
-    println!(
-        "  Commit:     {}",
-        if result.commit.len() > 12 {
-            &result.commit[..12]
-        } else {
-            &result.commit
-        }
-    );
-
-    Ok(())
-}
-
-fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::connect()?;
-    let result = client.list()?;
-
-    if result.repos.is_empty() {
-        println!("No repositories cached");
-        return Ok(());
-    }
-
-    println!(
-        "{:<40} {:>12} {:>12} {:>15} {:>15}",
-        "REPO", "PRIORITY", "GENERATION", "LAST SYNC", "LAST ACCESS"
-    );
-    println!("{}", "-".repeat(100));
-
-    for repo in result.repos {
-        let repo_name = format!("{}/{}", repo.owner, repo.repo);
-        let priority = if repo.priority > 0 {
-            format!("{} (watched)", repo.priority)
-        } else {
-            "-".to_string()
-        };
-        let generation = match (repo.generation, repo.shallow) {
-            (Some(_), Some(true)) => "shallow".to_string(),
-            (Some(g), Some(false)) => g.to_string(),
-            (Some(g), None) => g.to_string(),
-            (None, _) => "-".to_string(),
-        };
-        let last_sync = repo.last_sync.unwrap_or_else(|| "never".to_string());
-        let last_access = repo.last_access.unwrap_or_else(|| "never".to_string());
-
-        println!(
-            "{:<40} {:>12} {:>12} {:>15} {:>15}",
-            repo_name, priority, generation, last_sync, last_access
-        );
-    }
 
     Ok(())
 }

@@ -263,171 +263,6 @@ impl GitCli {
 
         Ok(())
     }
-
-    /// Clone a GitHub repository as a bare repository with full history.
-    ///
-    /// Creates `<dest>` as a bare git repo with complete history.
-    pub fn clone_bare_full(&self, owner: &str, repo: &str, dest: &Path) -> Result<(), GitError> {
-        // Validate inputs to prevent injection attacks
-        validate_name(owner, "owner")?;
-        validate_name(repo, "repo")?;
-
-        let dest_existed = dest.exists();
-
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let url = format!("https://github.com/{owner}/{repo}.git");
-        let dest_str = dest.to_str().ok_or_else(|| {
-            GitError::ParseError("destination path is not valid UTF-8".to_string())
-        })?;
-
-        let output = self
-            .command()
-            .args(["clone", "--bare"])
-            .arg(&url)
-            .arg(dest_str)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !dest_existed {
-                let _ = std::fs::remove_dir_all(dest);
-            }
-            return Err(GitError::CloneError(stderr.into_owned()));
-        }
-
-        Ok(())
-    }
-
-    /// Fetch updates from origin for a specific branch (full history, no depth limit).
-    ///
-    /// Used for repos that have been unshallowed.
-    pub fn fetch_full(&self, mirror_path: &Path, branch: &str) -> Result<(), GitError> {
-        // Validate branch name to prevent injection
-        validate_git_ref(branch, "branch")?;
-
-        let mirror_str = mirror_path
-            .to_str()
-            .ok_or_else(|| GitError::ParseError("mirror path is not valid UTF-8".to_string()))?;
-
-        let refspec = format!("+refs/heads/{0}:refs/heads/{0}", branch);
-
-        let output = self
-            .command()
-            .arg("-C")
-            .arg(mirror_str)
-            .args(["fetch", "origin"])
-            .arg(&refspec)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GitError::FetchError(stderr.into_owned()));
-        }
-
-        Ok(())
-    }
-
-    /// Check if a repository is a shallow clone.
-    pub fn is_shallow_repo(&self, mirror_path: &Path) -> Result<bool, GitError> {
-        let mirror_str = mirror_path
-            .to_str()
-            .ok_or_else(|| GitError::ParseError("mirror path is not valid UTF-8".to_string()))?;
-
-        let output = self
-            .command()
-            .arg("-C")
-            .arg(mirror_str)
-            .args(["rev-parse", "--is-shallow-repository"])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GitError::ParseError(format!(
-                "failed to check shallow status: {}",
-                stderr
-            )));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.trim() == "true")
-    }
-
-    /// Fetch full history for a shallow repository (unshallow).
-    ///
-    /// This converts a shallow clone to a full clone by fetching all history.
-    pub fn fetch_unshallow(&self, mirror_path: &Path, branch: &str) -> Result<(), GitError> {
-        // Validate branch name to prevent injection
-        validate_git_ref(branch, "branch")?;
-
-        let mirror_str = mirror_path
-            .to_str()
-            .ok_or_else(|| GitError::ParseError("mirror path is not valid UTF-8".to_string()))?;
-
-        let refspec = format!("+refs/heads/{0}:refs/heads/{0}", branch);
-
-        let output = self
-            .command()
-            .arg("-C")
-            .arg(mirror_str)
-            .args(["fetch", "--unshallow", "origin"])
-            .arg(&refspec)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GitError::FetchError(stderr.into_owned()));
-        }
-
-        Ok(())
-    }
-
-    /// Convert a full-history repo back to shallow (depth=1) and run gc.
-    ///
-    /// This fetches with --depth=1 to update shallow grafts, then runs
-    /// `git gc --prune=now` to actually remove the old objects from disk.
-    pub fn fetch_reshallow(&self, mirror_path: &Path, branch: &str) -> Result<(), GitError> {
-        // Validate branch name to prevent injection
-        validate_git_ref(branch, "branch")?;
-
-        let mirror_str = mirror_path
-            .to_str()
-            .ok_or_else(|| GitError::ParseError("mirror path is not valid UTF-8".to_string()))?;
-
-        let refspec = format!("+refs/heads/{0}:refs/heads/{0}", branch);
-
-        // Fetch with depth=1 to re-shallow
-        let output = self
-            .command()
-            .arg("-C")
-            .arg(mirror_str)
-            .args(["fetch", "--depth=1", "origin"])
-            .arg(&refspec)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GitError::FetchError(stderr.into_owned()));
-        }
-
-        // Run gc --prune=now to actually remove old objects
-        let gc_output = self
-            .command()
-            .arg("-C")
-            .arg(mirror_str)
-            .args(["gc", "--prune=now"])
-            .output()?;
-
-        if !gc_output.status.success() {
-            let stderr = String::from_utf8_lossy(&gc_output.stderr);
-            // Log warning but don't fail - the fetch succeeded
-            log::warn!("git gc failed after reshallow: {}", stderr);
-        }
-
-        Ok(())
-    }
 }
 
 /// Open an existing repository at the given path.
@@ -468,68 +303,9 @@ pub fn resolve_default_branch(repo: &Repository) -> Result<(String, String), Git
 }
 
 /// Check if a path contains a valid git repository.
+#[cfg(test)]
 pub fn repository_exists(path: &Path) -> bool {
     Repository::open(path).is_ok()
-}
-
-/// Clone a GitHub repository as a bare, shallow repository.
-///
-/// Convenience wrapper around `GitCli::clone_bare_shallow`.
-pub fn clone_bare_shallow(owner: &str, repo: &str, dest: &Path) -> Result<(), GitError> {
-    GitCli::new().clone_bare_shallow(owner, repo, dest)
-}
-
-/// Clone a GitHub repository as a bare repository with full history.
-///
-/// Convenience wrapper around `GitCli::clone_bare_full`.
-pub fn clone_bare_full(owner: &str, repo: &str, dest: &Path) -> Result<(), GitError> {
-    GitCli::new().clone_bare_full(owner, repo, dest)
-}
-
-/// Fetch updates from origin for a specific branch (shallow).
-///
-/// Convenience wrapper around `GitCli::fetch_shallow`.
-pub fn fetch_shallow(mirror_path: &Path, branch: &str) -> Result<(), GitError> {
-    GitCli::new().fetch_shallow(mirror_path, branch)
-}
-
-/// Fetch updates from origin for a specific branch (full history).
-///
-/// Convenience wrapper around `GitCli::fetch_full`.
-pub fn fetch_full(mirror_path: &Path, branch: &str) -> Result<(), GitError> {
-    GitCli::new().fetch_full(mirror_path, branch)
-}
-
-/// Check if a repository is a shallow clone.
-///
-/// Convenience wrapper around `GitCli::is_shallow_repo`.
-pub fn is_shallow_repo(mirror_path: &Path) -> Result<bool, GitError> {
-    GitCli::new().is_shallow_repo(mirror_path)
-}
-
-/// Fetch full history for a shallow repository (unshallow).
-///
-/// Convenience wrapper around `GitCli::fetch_unshallow`.
-pub fn fetch_unshallow(mirror_path: &Path, branch: &str) -> Result<(), GitError> {
-    GitCli::new().fetch_unshallow(mirror_path, branch)
-}
-
-/// Convert a full-history repo back to shallow (depth=1) and run gc.
-///
-/// Convenience wrapper around `GitCli::fetch_reshallow`.
-pub fn fetch_reshallow(mirror_path: &Path, branch: &str) -> Result<(), GitError> {
-    GitCli::new().fetch_reshallow(mirror_path, branch)
-}
-
-/// Create a detached worktree from a bare repository at a specific commit.
-///
-/// Convenience wrapper around `GitCli::create_worktree`.
-pub fn create_worktree(
-    mirror_path: &Path,
-    worktree_path: &Path,
-    commit: &str,
-) -> Result<(), GitError> {
-    GitCli::new().create_worktree(mirror_path, worktree_path, commit)
 }
 
 #[cfg(test)]
@@ -603,7 +379,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("hello-world.git");
 
-        let result = clone_bare_shallow("octocat", "Hello-World", &dest);
+        let result = GitCli::new().clone_bare_shallow("octocat", "Hello-World", &dest);
 
         assert!(result.is_ok(), "Clone failed: {:?}", result.err());
         assert!(
@@ -625,7 +401,9 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("hello-world.git");
 
-        clone_bare_shallow("octocat", "Hello-World", &dest).expect("Clone failed");
+        GitCli::new()
+            .clone_bare_shallow("octocat", "Hello-World", &dest)
+            .expect("Clone failed");
         let repo = open_repository(&dest).expect("Failed to open repo");
         let result = resolve_default_branch(&repo);
         assert!(
@@ -665,11 +443,13 @@ mod tests {
         let mirror_path = temp_dir.path().join("hello-world.git");
         let worktree_path = temp_dir.path().join("hello-world-worktree");
 
-        clone_bare_shallow("octocat", "Hello-World", &mirror_path).expect("Clone failed");
+        GitCli::new()
+            .clone_bare_shallow("octocat", "Hello-World", &mirror_path)
+            .expect("Clone failed");
         let repo = open_repository(&mirror_path).expect("Failed to open repo");
         let (_branch_name, commit_sha) =
             resolve_default_branch(&repo).expect("Failed to resolve default branch");
-        let result = create_worktree(&mirror_path, &worktree_path, &commit_sha);
+        let result = GitCli::new().create_worktree(&mirror_path, &worktree_path, &commit_sha);
         assert!(result.is_ok(), "create_worktree failed: {:?}", result.err());
         let git_path = worktree_path.join(".git");
         let metadata = fs::metadata(&git_path).expect(".git should exist");
@@ -696,11 +476,13 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let mirror_path = temp_dir.path().join("hello-world.git");
 
-        clone_bare_shallow("octocat", "Hello-World", &mirror_path).expect("Clone failed");
+        GitCli::new()
+            .clone_bare_shallow("octocat", "Hello-World", &mirror_path)
+            .expect("Clone failed");
         let repo = open_repository(&mirror_path).expect("Failed to open repo");
         let (branch_name, initial_commit) =
             resolve_default_branch(&repo).expect("Failed to resolve default branch");
-        let result = fetch_shallow(&mirror_path, &branch_name);
+        let result = GitCli::new().fetch_shallow(&mirror_path, &branch_name);
         assert!(result.is_ok(), "fetch_shallow failed: {:?}", result.err());
         // Re-open because git2 caches refs.
         let repo = open_repository(&mirror_path).expect("Failed to open repo after fetch");
@@ -730,7 +512,9 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("hello-world.git");
 
-        clone_bare_shallow("octocat", "Hello-World", &dest).expect("Clone failed");
+        GitCli::new()
+            .clone_bare_shallow("octocat", "Hello-World", &dest)
+            .expect("Clone failed");
         let result = open_repository(&dest);
         assert!(result.is_ok(), "open_repository failed: {:?}", result.err());
 
@@ -748,7 +532,9 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("hello-world.git");
 
-        clone_bare_shallow("octocat", "Hello-World", &dest).expect("Clone failed");
+        GitCli::new()
+            .clone_bare_shallow("octocat", "Hello-World", &dest)
+            .expect("Clone failed");
 
         assert!(repository_exists(&dest));
     }
@@ -856,7 +642,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("test.git");
 
-        let result = clone_bare_shallow("../malicious", "repo", &dest);
+        let result = GitCli::new().clone_bare_shallow("../malicious", "repo", &dest);
         assert!(matches!(result, Err(GitError::InvalidInput(_))));
     }
 
@@ -866,7 +652,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let dest = temp_dir.path().join("test.git");
 
-        let result = clone_bare_shallow("owner", "-malicious", &dest);
+        let result = GitCli::new().clone_bare_shallow("owner", "-malicious", &dest);
         assert!(matches!(result, Err(GitError::InvalidInput(_))));
     }
 
@@ -875,7 +661,7 @@ mod tests {
         use tempfile::tempdir;
         let temp_dir = tempdir().expect("Failed to create temp directory");
 
-        let result = fetch_shallow(temp_dir.path(), "-malicious");
+        let result = GitCli::new().fetch_shallow(temp_dir.path(), "-malicious");
         assert!(matches!(result, Err(GitError::InvalidInput(_))));
     }
 
@@ -885,181 +671,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let worktree_path = temp_dir.path().join("worktree");
 
-        let result = create_worktree(temp_dir.path(), &worktree_path, "-malicious");
+        let result = GitCli::new().create_worktree(temp_dir.path(), &worktree_path, "-malicious");
         assert!(matches!(result, Err(GitError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn is_shallow_repo_returns_true_for_shallow_clone() {
-        if !require_network() {
-            return;
-        }
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().expect("Failed to create temp directory");
-        let dest = temp_dir.path().join("hello-world.git");
-
-        clone_bare_shallow("octocat", "Hello-World", &dest).expect("Clone failed");
-
-        let result = is_shallow_repo(&dest);
-        assert!(result.is_ok(), "is_shallow_repo failed: {:?}", result.err());
-        assert!(
-            result.unwrap(),
-            "Shallow clone should be detected as shallow"
-        );
-    }
-
-    #[test]
-    fn clone_bare_full_creates_non_shallow_repo() {
-        if !require_network() {
-            return;
-        }
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().expect("Failed to create temp directory");
-        let dest = temp_dir.path().join("hello-world.git");
-
-        let result = clone_bare_full("octocat", "Hello-World", &dest);
-        assert!(result.is_ok(), "Full clone failed: {:?}", result.err());
-        assert!(
-            dest.join("HEAD").exists(),
-            "HEAD file should exist in bare repo"
-        );
-
-        let is_shallow = is_shallow_repo(&dest).expect("is_shallow_repo failed");
-        assert!(!is_shallow, "Full clone should not be shallow");
-
-        let repo = open_repository(&dest).expect("Should be able to open cloned repo");
-        assert!(repo.is_bare(), "Repository should be bare");
-    }
-
-    #[test]
-    fn unshallow_converts_shallow_to_full() {
-        if !require_network() {
-            return;
-        }
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().expect("Failed to create temp directory");
-        let mirror_path = temp_dir.path().join("hello-world.git");
-
-        // Start with shallow clone
-        clone_bare_shallow("octocat", "Hello-World", &mirror_path).expect("Clone failed");
-        assert!(
-            is_shallow_repo(&mirror_path).unwrap(),
-            "Should start as shallow"
-        );
-
-        // Unshallow
-        let repo = open_repository(&mirror_path).expect("Failed to open repo");
-        let (branch, _) = resolve_default_branch(&repo).expect("Failed to resolve branch");
-        let result = fetch_unshallow(&mirror_path, &branch);
-        assert!(result.is_ok(), "fetch_unshallow failed: {:?}", result.err());
-
-        // Verify no longer shallow
-        let is_shallow = is_shallow_repo(&mirror_path).expect("is_shallow_repo failed");
-        assert!(
-            !is_shallow,
-            "Repo should no longer be shallow after unshallow"
-        );
-    }
-
-    #[test]
-    fn reshallow_converts_full_to_shallow() {
-        if !require_network() {
-            return;
-        }
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().expect("Failed to create temp directory");
-        let mirror_path = temp_dir.path().join("hello-world.git");
-
-        // Start with full clone
-        clone_bare_full("octocat", "Hello-World", &mirror_path).expect("Clone failed");
-        assert!(
-            !is_shallow_repo(&mirror_path).unwrap(),
-            "Should start as non-shallow"
-        );
-
-        // Reshallow
-        let repo = open_repository(&mirror_path).expect("Failed to open repo");
-        let (branch, _) = resolve_default_branch(&repo).expect("Failed to resolve branch");
-        let result = fetch_reshallow(&mirror_path, &branch);
-        assert!(result.is_ok(), "fetch_reshallow failed: {:?}", result.err());
-
-        // Verify now shallow
-        let is_shallow = is_shallow_repo(&mirror_path).expect("is_shallow_repo failed");
-        assert!(is_shallow, "Repo should be shallow after reshallow");
-    }
-
-    #[test]
-    fn fetch_full_works_on_non_shallow_repo() {
-        if !require_network() {
-            return;
-        }
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().expect("Failed to create temp directory");
-        let mirror_path = temp_dir.path().join("hello-world.git");
-
-        // Start with full clone
-        clone_bare_full("octocat", "Hello-World", &mirror_path).expect("Clone failed");
-
-        let repo = open_repository(&mirror_path).expect("Failed to open repo");
-        let (branch, initial_commit) =
-            resolve_default_branch(&repo).expect("Failed to resolve branch");
-
-        // Fetch full
-        let result = fetch_full(&mirror_path, &branch);
-        assert!(result.is_ok(), "fetch_full failed: {:?}", result.err());
-
-        // Re-open and verify still works
-        let repo = open_repository(&mirror_path).expect("Failed to open repo after fetch");
-        let (_, post_fetch_commit) =
-            resolve_default_branch(&repo).expect("Failed to resolve branch after fetch");
-
-        assert_eq!(
-            post_fetch_commit.len(),
-            40,
-            "Post-fetch commit SHA should be 40 characters"
-        );
-
-        println!("Initial commit: {}", initial_commit);
-        println!("Post-fetch commit: {}", post_fetch_commit);
-    }
-
-    #[test]
-    fn unshallow_then_reshallow_roundtrip() {
-        if !require_network() {
-            return;
-        }
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().expect("Failed to create temp directory");
-        let mirror_path = temp_dir.path().join("hello-world.git");
-
-        // Start with shallow clone
-        clone_bare_shallow("octocat", "Hello-World", &mirror_path).expect("Clone failed");
-        assert!(
-            is_shallow_repo(&mirror_path).unwrap(),
-            "Should start shallow"
-        );
-
-        let repo = open_repository(&mirror_path).expect("Failed to open repo");
-        let (branch, _) = resolve_default_branch(&repo).expect("Failed to resolve branch");
-
-        // Unshallow
-        fetch_unshallow(&mirror_path, &branch).expect("Unshallow failed");
-        assert!(
-            !is_shallow_repo(&mirror_path).unwrap(),
-            "Should be non-shallow after unshallow"
-        );
-
-        // Reshallow
-        fetch_reshallow(&mirror_path, &branch).expect("Reshallow failed");
-        assert!(
-            is_shallow_repo(&mirror_path).unwrap(),
-            "Should be shallow after reshallow"
-        );
     }
 }

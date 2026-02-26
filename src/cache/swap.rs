@@ -2,7 +2,7 @@
 
 use std::io;
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global counter for unique temp file names within a process
@@ -36,15 +36,6 @@ pub fn atomic_symlink_swap(link_path: &Path, new_target: &Path) -> io::Result<()
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-    }
-}
-
-/// Read the target of a symlink, returning None if it doesn't exist.
-pub fn read_symlink_target(link_path: &Path) -> io::Result<Option<PathBuf>> {
-    match std::fs::read_link(link_path) {
-        Ok(target) => Ok(Some(target)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
     }
 }
 
@@ -89,7 +80,7 @@ mod tests {
 
         let num_threads = 10;
         let num_iterations = 100;
-        let targets: Vec<PathBuf> = (0..num_threads)
+        let targets: Vec<std::path::PathBuf> = (0..num_threads)
             .map(|i| {
                 let target = temp_dir.path().join(format!("target_{}", i));
                 std::fs::create_dir(&target).unwrap();
