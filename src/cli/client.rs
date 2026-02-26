@@ -3,8 +3,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::protocol::{
-    read_response, write_message, GcResult, ListResult, Request, Response, RpcError, RpcRequest,
-    StatusResult, SyncResult, VersionResult,
+    GcResult, ListResult, Request, Response, RpcError, RpcRequest, StatusResult, SyncResult,
+    VersionResult, read_response, write_message,
 };
 
 /// Get the socket path

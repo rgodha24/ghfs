@@ -1,0 +1,22 @@
+name: PublishCrates
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  cargo-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Publish ghfs to crates.io
+        run: cargo publish -p ghfs --locked --token "${CRATES_TOKEN}"
+        env:
+          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}

@@ -1,7 +1,12 @@
 [package]
 name = "ghfs"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "Mount GitHub repositories as a local filesystem"
+license = "MIT"
+repository = "https://github.com/rgodha24/ghfs"
+homepage = "https://github.com/rgodha24/ghfs"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -31,3 +36,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 [dev-dependencies]
 filetime = "0.2"
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
