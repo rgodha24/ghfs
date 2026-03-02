@@ -1,5 +1,7 @@
 # ghfs
 
+Coding Agents are _really_ good at using example code and documentation for libraries
+
 Mount GitHub repositories as a local filesystem.
 
 `ghfs daemon` is the foreground daemon entry point. It does not daemonize itself; use your

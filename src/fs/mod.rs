@@ -427,6 +427,22 @@ impl GhFs {
         }
     }
 
+    /// Determine the TTL for a FUSE lookup reply based on parent context.
+    ///
+    /// Direct children of a repo virtual node need a short TTL so that
+    /// generation swaps (from sync or background refresh) surface quickly.
+    /// Deeper descendants within a generation use the longer [`FILE_TTL`]
+    /// since generation worktrees are immutable.
+    #[cfg(target_os = "linux")]
+    fn lookup_ttl(&self, parent: u64, child: u64) -> Duration {
+        if let Some(node) = self.virtual_nodes.get(&parent) {
+            if matches!(node.value(), VirtualNode::Repo { .. }) {
+                return REPO_TTL;
+            }
+        }
+        self.ttl_for_inode(child)
+    }
+
     fn virtual_dir_attr(&self, ino: u64) -> NodeAttr {
         NodeAttr {
             ino,
@@ -752,7 +768,7 @@ impl Filesystem for GhFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.lookup_inode(parent, name) {
             Ok(ino) => match self.stat_inode(ino) {
-                Ok(attr) => reply.entry(&self.ttl_for_inode(ino), &attr.to_fuse_attr(), 0),
+                Ok(attr) => reply.entry(&self.lookup_ttl(parent, ino), &attr.to_fuse_attr(), 0),
                 Err(err) => reply.error(err),
             },
             Err(err) => reply.error(err),
