@@ -67,7 +67,7 @@ pub struct Daemon {
 }
 
 /// Spawn a detached thread to unmount the active filesystem backend.
-pub(crate) fn spawn_unmount(mount_point: String) {
+pub fn spawn_unmount(mount_point: String) {
     std::thread::spawn(move || {
         // Small delay to allow any response to be sent first.
         std::thread::sleep(std::time::Duration::from_millis(100));

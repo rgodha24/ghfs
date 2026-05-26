@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::cli::{Client, ClientError};
 use crate::daemon;
-use crate::protocol::VersionResult;
+use crate::protocol::{Request, VersionResult};
 
 const SYSTEMD_SERVICE_NAME: &str = "ghfs";
 const SYSTEMD_UNIT_FILE: &str = "ghfs.service";
@@ -135,17 +135,27 @@ pub fn stop(force: bool) -> Result<(), ServiceError> {
         kill_open_mount_processes()?;
     }
 
-    match ServiceBackend::detect()? {
+    try_graceful_stop();
+
+    let result = match ServiceBackend::detect()? {
         ServiceBackend::Systemd => stop_systemd(),
         ServiceBackend::Launchd => stop_launchd(),
-    }
+    };
+
+    try_unmount();
+    result
 }
 
 pub fn restart() -> Result<(), ServiceError> {
-    match ServiceBackend::detect()? {
+    try_graceful_stop();
+
+    let result = match ServiceBackend::detect()? {
         ServiceBackend::Systemd => restart_systemd(),
         ServiceBackend::Launchd => restart_launchd(),
-    }
+    };
+
+    try_unmount();
+    result
 }
 
 pub fn logs() -> Result<(), ServiceError> {
@@ -258,6 +268,42 @@ pub fn kill_open_mount_processes() -> Result<(), ServiceError> {
 
     std::thread::sleep(std::time::Duration::from_millis(100));
     Ok(())
+}
+
+/// Try to gracefully stop the daemon via RPC so it unmounts itself.
+fn try_graceful_stop() {
+    if let Ok(mut client) = Client::connect() {
+        let _ = client.call(Request::Stop);
+        // Give spawn_unmount time to run
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// Explicitly unmount the mount point as a fallback cleanup.
+fn try_unmount() {
+    let mount_point = daemon::mount_point().to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("diskutil")
+            .args(["unmount", &mount_point])
+            .status();
+        let _ = Command::new("diskutil")
+            .args(["unmount", "force", &mount_point])
+            .status();
+        let _ = Command::new("umount").arg(&mount_point).status();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("fusermount3")
+            .args(["-u", &mount_point])
+            .status();
+        let _ = Command::new("fusermount")
+            .args(["-u", &mount_point])
+            .status();
+        let _ = Command::new("umount").args(["-l", &mount_point]).status();
+    }
 }
 
 fn install_systemd(no_start: bool) -> Result<(), ServiceError> {
