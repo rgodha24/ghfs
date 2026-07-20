@@ -672,14 +672,25 @@ impl GhFs {
 }
 
 #[cfg(target_os = "macos")]
+const DEFAULT_NFS_PORT: u16 = 11111;
+#[cfg(target_os = "macos")]
+const MAX_NFS_PORT_SCAN: u16 = 100;
+
+#[cfg(target_os = "macos")]
 impl GhFs {
     /// Mount the filesystem at the given path using an in-process NFSv3 server.
     pub fn mount(self, mountpoint: &Path) -> std::io::Result<()> {
-        if !mountpoint.exists() {
-            std::fs::create_dir_all(mountpoint)?;
-        }
+        std::fs::create_dir_all(mountpoint)?;
+        let mountpoint = std::fs::canonicalize(mountpoint).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to canonicalize mountpoint {}: {e}",
+                    mountpoint.display()
+                ),
+            )
+        })?;
 
-        let mountpoint = mountpoint.to_path_buf();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -691,48 +702,42 @@ impl GhFs {
     async fn mount_nfs_foreground(self, mountpoint: PathBuf) -> std::io::Result<()> {
         use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
-        let mut listener = NFSTcpListener::bind("127.0.0.1:0", self).await?;
-        let port = listener.get_listen_port();
-        let ip = listener.get_listen_ip();
-        let (mount_tx, mut mount_rx) = tokio::sync::mpsc::channel::<bool>(8);
-        listener.set_mount_listener(mount_tx);
+        let port = find_free_nfs_port(DEFAULT_NFS_PORT)?;
+        let bind_addr = format!("127.0.0.1:{port}");
+        let listener = NFSTcpListener::bind(&bind_addr, self).await.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to bind NFS listener on {bind_addr}: {e}"),
+            )
+        })?;
 
         let server_task = tokio::spawn(async move {
-            let _ = listener.handle_forever().await;
+            if let Err(e) = listener.handle_forever().await {
+                log::error!("NFS server task ended unexpectedly: {e}");
+            }
         });
 
-        let source = format!("{ip}:/");
-        let options = format!(
-            "rdonly,nolocks,vers=3,tcp,rsize=131072,actimeo=120,port={port},mountport={port}"
-        );
-        let target = mountpoint.to_string_lossy().to_string();
+        // Let the accept loop start before macOS's NFS client connects.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let status = std::process::Command::new("mount_nfs")
-            .args(["-o", &options, &source, &target])
-            .status()?;
+        // The mount process waits for NFS RPC replies, so keep it off the
+        // runtime threads that service those replies.
+        let mountpoint_for_command = mountpoint.clone();
+        let mount_result =
+            tokio::task::spawn_blocking(move || nfs_mount_command(port, &mountpoint_for_command))
+                .await
+                .map_err(|e| std::io::Error::other(format!("mount command task panicked: {e}")))?;
 
-        if !status.success() {
+        if let Err(e) = mount_result {
             server_task.abort();
             let _ = server_task.await;
-            return Err(std::io::Error::other(format!(
-                "mount_nfs failed with status: {status}"
-            )));
+            return Err(e);
         }
 
-        loop {
-            tokio::select! {
-                signal = mount_rx.recv() => {
-                    match signal {
-                        Some(false) | None => break,
-                        Some(true) => {}
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    if !is_mount_active(&mountpoint) {
-                        break;
-                    }
-                }
-            }
+        log::info!("NFS mount ready at {} (port {port})", mountpoint.display());
+
+        while is_mount_active(&mountpoint) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
         server_task.abort();
@@ -742,8 +747,52 @@ impl GhFs {
 }
 
 #[cfg(target_os = "macos")]
+fn nfs_mount_command(port: u16, mountpoint: &Path) -> std::io::Result<()> {
+    let options = format!(
+        "locallocks,vers=3,tcp,port={port},mountport={port},soft,timeo=100,retrans=3,acregmin=1,acregmax=5"
+    );
+    let output = std::process::Command::new("/sbin/mount_nfs")
+        .arg("-o")
+        .arg(options)
+        .arg("127.0.0.1:/")
+        .arg(mountpoint)
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to execute /sbin/mount_nfs: {e}"))
+        })?;
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "mount_nfs failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn find_free_nfs_port(start: u16) -> std::io::Result<u16> {
+    for offset in 0..MAX_NFS_PORT_SCAN {
+        let port = start.saturating_add(offset);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        format!(
+            "could not find a free NFS port in range {}-{}",
+            start,
+            start.saturating_add(MAX_NFS_PORT_SCAN)
+        ),
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn is_mount_active(mountpoint: &Path) -> bool {
-    let Ok(output) = std::process::Command::new("mount").output() else {
+    let Ok(output) = std::process::Command::new("/sbin/mount").output() else {
         return true;
     };
 

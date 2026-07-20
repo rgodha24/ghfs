@@ -79,24 +79,15 @@ pub fn spawn_unmount(mount_point: String) {
 
         #[cfg(target_os = "macos")]
         let status = {
-            let first = std::process::Command::new("diskutil")
-                .args(["unmount", &mount_point])
+            let first = std::process::Command::new("/sbin/umount")
+                .arg(&mount_point)
                 .status();
 
             match first {
                 Ok(exit) if exit.success() => Ok(exit),
-                _ => {
-                    let second = std::process::Command::new("diskutil")
-                        .args(["unmount", "force", &mount_point])
-                        .status();
-
-                    match second {
-                        Ok(exit) if exit.success() => Ok(exit),
-                        _ => std::process::Command::new("umount")
-                            .arg(&mount_point)
-                            .status(),
-                    }
-                }
+                _ => std::process::Command::new("/sbin/umount")
+                    .args(["-f", &mount_point])
+                    .status(),
             }
         };
 

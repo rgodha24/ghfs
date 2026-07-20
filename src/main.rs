@@ -208,7 +208,7 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "macos")]
     let (backend_ok, backend_label, backend_detail) = {
-        let mount_nfs_ok = std::process::Command::new("mount_nfs")
+        let mount_nfs_ok = std::process::Command::new("/sbin/mount_nfs")
             .arg("-h")
             .output()
             .is_ok();

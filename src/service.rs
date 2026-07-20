@@ -285,13 +285,16 @@ fn try_unmount() {
 
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("diskutil")
-            .args(["unmount", &mount_point])
-            .status();
-        let _ = Command::new("diskutil")
-            .args(["unmount", "force", &mount_point])
-            .status();
-        let _ = Command::new("umount").arg(&mount_point).status();
+        let unmounted = Command::new("/sbin/umount")
+            .arg(&mount_point)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !unmounted {
+            let _ = Command::new("/sbin/umount")
+                .args(["-f", &mount_point])
+                .status();
+        }
     }
 
     #[cfg(target_os = "linux")]
