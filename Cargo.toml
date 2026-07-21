@@ -15,6 +15,7 @@ ctrlc = "3.5.1"
 dashmap = "6"
 dirs = "6"
 env_logger = "0.11"
+lru = "0.12"
 fs2 = "0.4"
 git2 = { version = "0.19", default-features = false }
 libc = "0.2"

@@ -7,8 +7,10 @@
 //! same store implementation.
 
 pub mod git;
+pub mod tree;
 
 pub use git::{GitCli, GitError, resolve_head, resolve_revision};
+pub use tree::{EntryKind, TreeCache, TreeEntry, TreeError, TreeReader};
 
 /// Best-effort redaction of embedded credentials from a git error string.
 ///
@@ -16,19 +18,23 @@ pub use git::{GitCli, GitError, resolve_head, resolve_revision};
 /// when a clone or fetch fails. This rewrites the `user:pass@` userinfo
 /// segment to `***` so logged errors stay safe.
 pub(crate) fn redact_creds(s: &str) -> String {
+    // Scan for `https://` followed by `user:pass@`; replace the userinfo with
+    // `***`. Everything else is copied verbatim.
+    let needle = "https://";
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'h'
-            && s[i..].starts_with("https://")
-            && let Some(rest_start) = s[i + 8..].find('@').map(|p| i + 8 + p + 1)
+    while i < s.len() {
+        if s[i..].starts_with(needle)
+            && let Some(at) = s[i + needle.len()..].find('@')
         {
-            // Locate the host boundary we'll resume output from.
             out.push_str("https://***@");
-            i = rest_start;
+            i = i + needle.len() + at + 1;
         } else {
-            out.push(bytes[i] as char);
+            // SAFETY: index `i` is a valid char boundary because we only ever
+            // advance by whole-`start_with` chunks or by one byte (ASCII),
+            // and the input is treated as bytes for the fast path.
+            let c = s.as_bytes()[i] as char;
+            out.push(c);
             i += 1;
         }
     }
