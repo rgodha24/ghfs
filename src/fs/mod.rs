@@ -1,18 +1,23 @@
 //! GHFS filesystem backends.
 //!
-//! Linux uses FUSE (`fuser`) and macOS uses an in-process NFSv3 server (`nfsserve`).
+//! Linux uses FUSE (`fuser`) and macOS uses an in-process NFSv3 server
+//! (`nfsserve`). Both backends delegate to the same store-backed [`GhFs`],
+//! which synthesizes inodes from git object identity (no worktree passthrough):
+//! directory inodes carry a git tree OID, file inodes carry a blob OID that is
+//! hydrated lazily by the store.
 
 use crate::cache::CachePaths;
 use crate::daemon::WorkerHandle;
-use crate::types::{GenerationId, Owner, Repo, RepoKey};
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
+use crate::store::git::MIN_OID_LEN;
+use crate::store::ref_selector::{BY_REF_ROOT, decode_ref, encode_ref};
+use crate::store::{EntryKind, Store, StoreError};
+use crate::types::{Owner, Repo, RepoKey};
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
@@ -33,19 +38,22 @@ mod inode;
 mod nfs;
 
 pub use inode::{
-    InodeInfo, InodeTable, PASSTHROUGH_INO_START, ROOT_INO, UnderlyingKey, VIRTUAL_INO_END,
+    BY_REF_INO, InodeData, InodeTable, PASSTHROUGH_INO_START, PathKey, ROOT_INO, VIRTUAL_INO_END,
     VIRTUAL_INO_START,
 };
 
-/// TTL for virtual root and owner directories.
+/// TTL for virtual discovery nodes (root, owners, by-ref roots, ref-repo
+/// directory listings).
 #[cfg(target_os = "linux")]
 const VIRTUAL_TTL: Duration = Duration::from_secs(60);
-/// TTL for repo boundary so generation changes surface quickly.
+/// TTL for mutable ref resolution (default-branch alias and named ref
+/// selectors). Short so a moved branch re-resolves promptly.
 #[cfg(target_os = "linux")]
-const REPO_TTL: Duration = Duration::from_secs(5);
-/// TTL for immutable generation contents.
+const REF_TTL: Duration = Duration::from_secs(5);
+/// TTL for content pinned to an immutable commit (commit-OID selectors and
+/// all repository path nodes). Long, since git objects never change.
 #[cfg(target_os = "linux")]
-const FILE_TTL: Duration = Duration::from_secs(3600);
+const COMMIT_TTL: Duration = Duration::from_secs(3600);
 
 #[cfg(target_os = "linux")]
 const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
@@ -53,19 +61,6 @@ const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
 const FINDER_INFO_XATTR_LIST: &[u8] = b"com.apple.FinderInfo\0";
 #[cfg(target_os = "linux")]
 const FINDER_INFO_SIZE: usize = 32;
-
-/// Virtual node types for dynamic owner/repo hierarchy.
-#[derive(Debug, Clone)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-enum VirtualNode {
-    Root,
-    Owner(String),
-    Repo {
-        owner: String,
-        repo: String,
-        parent: u64,
-    },
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FsKind {
@@ -104,45 +99,44 @@ fn io_errno(err: std::io::Error, fallback: i32) -> i32 {
     err.raw_os_error().unwrap_or(fallback)
 }
 
-fn metadata_kind(metadata: &std::fs::Metadata) -> FsKind {
-    if metadata.is_dir() {
-        FsKind::Directory
-    } else if metadata.is_symlink() {
-        FsKind::Symlink
-    } else {
-        FsKind::RegularFile
+fn store_err_errno(err: &StoreError) -> i32 {
+    match err {
+        StoreError::Git(g) => match g {
+            crate::store::GitError::NotFound(_) => libc::ENOENT,
+            crate::store::GitError::RefNotFound(_) => libc::ENOENT,
+            crate::store::GitError::AmbiguousRef(_) => libc::EINVAL,
+            crate::store::GitError::InvalidInput(_) => libc::EINVAL,
+            _ => libc::EIO,
+        },
+        StoreError::Tree(t) => match t {
+            crate::store::TreeError::NotATree(_) => libc::ENOTDIR,
+            crate::store::TreeError::InvalidPath => libc::ENOENT,
+            _ => libc::EIO,
+        },
+        StoreError::Blob(b) => match b {
+            crate::store::BlobError::BlobNotFound(_) => libc::ENOENT,
+            _ => libc::EIO,
+        },
+        StoreError::RepoNotFound(_) => libc::ENOENT,
+        StoreError::LockFailed => libc::EIO,
+        StoreError::Io(e) => io_errno(std::io::Error::from(e.kind()), libc::EIO),
     }
 }
 
-fn metadata_to_attr(ino: u64, metadata: &std::fs::Metadata) -> NodeAttr {
-    use std::os::unix::fs::MetadataExt;
-
-    NodeAttr {
-        ino,
-        size: metadata.len(),
-        blocks: metadata.blocks(),
-        atime: UNIX_EPOCH + Duration::from_secs(metadata.atime().max(0) as u64),
-        mtime: UNIX_EPOCH + Duration::from_secs(metadata.mtime().max(0) as u64),
-        ctime: UNIX_EPOCH + Duration::from_secs(metadata.ctime().max(0) as u64),
-        kind: metadata_kind(metadata),
-        perm: (metadata.mode() & 0o7777) as u16,
-        nlink: metadata.nlink() as u32,
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-        rdev: metadata.rdev() as u32,
-        blksize: metadata.blksize() as u32,
+fn entry_kind_to_fs(kind: EntryKind) -> FsKind {
+    match kind {
+        EntryKind::Tree => FsKind::Directory,
+        EntryKind::Blob | EntryKind::Executable | EntryKind::Gitlink => FsKind::RegularFile,
+        EntryKind::Symlink => FsKind::Symlink,
     }
 }
 
-fn underlying_key_from_metadata(
-    metadata: &std::fs::Metadata,
-    generation: GenerationId,
-) -> UnderlyingKey {
-    use std::os::unix::fs::MetadataExt;
-    UnderlyingKey {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        generation,
+fn entry_mode(kind: EntryKind) -> u16 {
+    match kind {
+        EntryKind::Tree => 0o040755,
+        EntryKind::Blob | EntryKind::Gitlink => 0o100644,
+        EntryKind::Executable => 0o100755,
+        EntryKind::Symlink => 0o120777,
     }
 }
 
@@ -178,9 +172,11 @@ impl NodeAttr {
     }
 }
 
-/// The GHFS filesystem.
+/// The GHFS filesystem. Backend-agnostic; both FUSE and NFS adapters delegate
+/// to the same store-backed methods.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub struct GhFs {
+    store: Store,
     worker: Arc<WorkerHandle>,
     cache_paths: CachePaths,
     inodes: InodeTable,
@@ -190,22 +186,16 @@ pub struct GhFs {
     open_files: Mutex<HashMap<u64, File>>,
     #[cfg(target_os = "linux")]
     next_fh: AtomicU64,
-    virtual_nodes: DashMap<u64, VirtualNode>,
-    virtual_names: DashMap<(u64, String), u64>,
-    next_virtual_ino: AtomicU64,
 }
 
 impl GhFs {
-    /// Create a new filesystem instance with worker and cache paths.
-    pub fn new(worker: Arc<WorkerHandle>, cache_paths: CachePaths) -> Self {
+    /// Create a new filesystem instance.
+    pub fn new(store: Store, worker: Arc<WorkerHandle>) -> Self {
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-
-        let virtual_nodes = DashMap::new();
-        virtual_nodes.insert(ROOT_INO, VirtualNode::Root);
-
         Self {
+            store,
             worker,
-            cache_paths,
+            cache_paths: CachePaths::default(),
             inodes: InodeTable::new(),
             uid,
             gid,
@@ -213,131 +203,44 @@ impl GhFs {
             open_files: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             next_fh: AtomicU64::new(1),
-            virtual_nodes,
-            virtual_names: DashMap::new(),
-            next_virtual_ino: AtomicU64::new(VIRTUAL_INO_START),
         }
     }
 
-    fn alloc_virtual_ino(&self) -> Result<u64, i32> {
-        self.next_virtual_ino
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current >= PASSTHROUGH_INO_START {
-                    None
-                } else {
-                    Some(current + 1)
-                }
-            })
-            .map_err(|_| libc::ENOSPC)
-    }
-
-    fn get_or_create_owner(&self, owner: &str) -> Result<u64, i32> {
-        let key = (ROOT_INO, owner.to_string());
-        match self.virtual_names.entry(key) {
-            Entry::Occupied(entry) => Ok(*entry.get()),
-            Entry::Vacant(entry) => {
-                let ino = self.alloc_virtual_ino()?;
-                self.virtual_nodes
-                    .insert(ino, VirtualNode::Owner(owner.to_string()));
-                entry.insert(ino);
-                Ok(ino)
-            }
+    fn virtual_dir_attr(&self, ino: u64) -> NodeAttr {
+        NodeAttr {
+            ino,
+            size: 4096,
+            blocks: 8,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            kind: FsKind::Directory,
+            perm: 0o755,
+            nlink: 2,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
         }
     }
 
-    fn get_or_create_repo(&self, parent_ino: u64, owner: &str, repo: &str) -> Result<u64, i32> {
-        let key = (parent_ino, repo.to_string());
-        match self.virtual_names.entry(key) {
-            Entry::Occupied(entry) => Ok(*entry.get()),
-            Entry::Vacant(entry) => {
-                let ino = self.alloc_virtual_ino()?;
-                self.virtual_nodes.insert(
-                    ino,
-                    VirtualNode::Repo {
-                        owner: owner.to_string(),
-                        repo: repo.to_string(),
-                        parent: parent_ino,
-                    },
-                );
-                entry.insert(ino);
-                Ok(ino)
-            }
+    fn file_attr(&self, ino: u64, kind: EntryKind, size: u64) -> NodeAttr {
+        let fskind = entry_kind_to_fs(kind);
+        NodeAttr {
+            ino,
+            size,
+            blocks: (size + 511) / 512,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            kind: fskind,
+            perm: entry_mode(kind) & 0o7777,
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
         }
-    }
-
-    fn ensure_repo_materialized(&self, owner: &str, repo: &str) -> Option<(PathBuf, GenerationId)> {
-        let key_str = format!("{owner}/{repo}");
-        let key: RepoKey = key_str.parse().ok()?;
-
-        let current_link = self.cache_paths.current_symlink(&key);
-        if current_link.exists() {
-            if let Ok(target) = std::fs::read_link(&current_link) {
-                let target = if target.is_absolute() {
-                    target
-                } else {
-                    current_link.parent().unwrap().join(&target)
-                };
-
-                if target.exists() {
-                    if let Some(name) = target.file_name().and_then(|s| s.to_str()) {
-                        if let Some(num_str) = name.strip_prefix("gen-") {
-                            if let Ok(num) = num_str.parse::<u64>() {
-                                self.worker.refresh(key);
-                                return Some((target, GenerationId::new(num)));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        match self.worker.materialize(key) {
-            Ok(gen_ref) => Some((gen_ref.path, gen_ref.generation)),
-            Err(err) => {
-                log::error!("Failed to materialize repo {owner}/{repo}: {err}");
-                None
-            }
-        }
-    }
-
-    fn list_cached_owners(&self) -> Vec<String> {
-        let worktrees_dir = self.cache_paths.worktrees_dir();
-        let mut owners = Vec::new();
-
-        if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if Self::is_valid_owner(name) {
-                            owners.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        owners.sort();
-        owners
-    }
-
-    fn list_cached_repos(&self, owner: &str) -> Vec<String> {
-        let owner_dir = self.cache_paths.worktrees_dir().join(owner);
-        let mut repos = Vec::new();
-
-        if let Ok(entries) = std::fs::read_dir(&owner_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if Self::is_valid_repo(name) {
-                            repos.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        repos.sort();
-        repos
     }
 
     fn is_valid_owner(name: &str) -> bool {
@@ -348,262 +251,575 @@ impl GhFs {
         name.parse::<Repo>().is_ok()
     }
 
-    #[cfg(target_os = "linux")]
-    fn inode_exists(&self, ino: u64) -> bool {
-        if InodeTable::is_virtual(ino) {
-            self.virtual_nodes.contains_key(&ino)
-        } else {
-            self.inodes.get(ino).is_some()
-        }
+    /// Whether a path component looks like a commit-OID selector (pure hex,
+    /// long enough). Used to pick the immutable-commit TTL.
+    fn is_commit_oid_selector(name: &str) -> bool {
+        name.len() >= MIN_OID_LEN && name.chars().all(|c| c.is_ascii_hexdigit())
     }
 
-    #[cfg(target_os = "linux")]
-    fn ttl_for_inode(&self, ino: u64) -> Duration {
-        if InodeTable::is_virtual(ino) {
-            if let Some(node) = self.virtual_nodes.get(&ino) {
-                match node.value() {
-                    VirtualNode::Root | VirtualNode::Owner(_) => VIRTUAL_TTL,
-                    VirtualNode::Repo { .. } => REPO_TTL,
+    fn list_cached_owners(&self) -> Vec<String> {
+        let mut owners = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(self.cache_paths.mirrors_dir()) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && let Some(name) = entry.file_name().to_str()
+                    && Self::is_valid_owner(name)
+                {
+                    owners.push(name.to_string());
                 }
-            } else {
-                VIRTUAL_TTL
-            }
-        } else {
-            FILE_TTL
-        }
-    }
-
-    /// Determine the TTL for a FUSE lookup reply based on parent context.
-    ///
-    /// Direct children of a repo virtual node need a short TTL so that
-    /// generation swaps (from sync or background refresh) surface quickly.
-    /// Deeper descendants within a generation use the longer [`FILE_TTL`]
-    /// since generation worktrees are immutable.
-    #[cfg(target_os = "linux")]
-    fn lookup_ttl(&self, parent: u64, child: u64) -> Duration {
-        if let Some(node) = self.virtual_nodes.get(&parent) {
-            if matches!(node.value(), VirtualNode::Repo { .. }) {
-                return REPO_TTL;
             }
         }
-        self.ttl_for_inode(child)
+        owners.sort();
+        owners
     }
 
-    fn virtual_dir_attr(&self, ino: u64) -> NodeAttr {
-        NodeAttr {
-            ino,
-            size: 0,
-            blocks: 0,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            kind: FsKind::Directory,
-            perm: 0o755,
-            nlink: 2,
-            uid: self.uid,
-            gid: self.gid,
-            rdev: 0,
-            blksize: 512,
-        }
-    }
-
-    fn stat_inode(&self, ino: u64) -> Result<NodeAttr, i32> {
-        if InodeTable::is_virtual(ino) {
-            if self.virtual_nodes.contains_key(&ino) {
-                Ok(self.virtual_dir_attr(ino))
-            } else {
-                Err(libc::ENOENT)
+    fn list_cached_repos(&self, owner: &str) -> Vec<String> {
+        let dir = self.cache_paths.mirrors_dir().join(owner);
+        let mut repos = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str()
+                    && let Some(stripped) = name.strip_suffix(".git")
+                    && Self::is_valid_repo(stripped)
+                {
+                    repos.push(stripped.to_string());
+                }
             }
-        } else {
-            let info = self.inodes.get(ino).ok_or(libc::ENOENT)?;
-            let metadata =
-                std::fs::symlink_metadata(&info.path).map_err(|e| io_errno(e, libc::EIO))?;
-            Ok(metadata_to_attr(ino, &metadata))
         }
+        repos.sort();
+        repos
     }
 
-    fn lookup_path_child(
-        &self,
-        parent: u64,
-        base_path: &Path,
-        generation: GenerationId,
-        name: &OsStr,
-    ) -> Result<u64, i32> {
-        let child_path = base_path.join(name);
-        let metadata =
-            std::fs::symlink_metadata(&child_path).map_err(|e| io_errno(e, libc::ENOENT))?;
-        let key = underlying_key_from_metadata(&metadata, generation);
-        let (ino, _) = self.inodes.get_or_insert(child_path, key, parent);
-        Ok(ino)
+    /// Ensure a repo's mirror exists and return its default-branch (HEAD)
+    /// commit. Off-loaded to the worker so the mount thread isn't the one
+    /// performing a network clone.
+    fn materialize_head(&self, key: &RepoKey) -> Result<String, i32> {
+        self.worker.materialize(key.clone()).map_err(|e| {
+            log::error!("materialize {key} failed: {e}");
+            store_err_errno(&e)
+        })
+    }
+
+    /// Ensure a repo mirror exists and resolve a ref selector to a commit OID.
+    fn resolve_selector(&self, key: &RepoKey, selector: &str) -> Result<String, i32> {
+        self.worker
+            .resolve(key.clone(), selector.to_string())
+            .map_err(|e| {
+                log::error!("resolve {key} {selector} failed: {e}");
+                store_err_errno(&e)
+            })
     }
 
     fn lookup_inode(&self, parent: u64, name: &OsStr) -> Result<u64, i32> {
         let name_str = name.to_str().ok_or(libc::ENOENT)?;
 
+        // ---- virtual discovery hierarchy ----
         if parent == ROOT_INO {
+            if name_str == BY_REF_ROOT {
+                return Ok(BY_REF_INO);
+            }
             if !Self::is_valid_owner(name_str) {
                 return Err(libc::ENOENT);
             }
-            return self.get_or_create_owner(name_str);
+            return Ok(self.inodes.get_or_alloc_virtual(
+                parent,
+                name_str,
+                InodeData::Owner(name_str.parse::<Owner>().unwrap()),
+            )?);
         }
 
-        if let Some(parent_node) = self.virtual_nodes.get(&parent).map(|n| n.clone()) {
-            return match parent_node {
-                VirtualNode::Owner(owner) => {
-                    if !Self::is_valid_repo(name_str) {
-                        Err(libc::ENOENT)
-                    } else {
-                        self.get_or_create_repo(parent, &owner, name_str)
-                    }
+        if parent == BY_REF_INO {
+            if !Self::is_valid_owner(name_str) {
+                return Err(libc::ENOENT);
+            }
+            return Ok(self.inodes.get_or_alloc_virtual(
+                parent,
+                name_str,
+                InodeData::RefOwner(name_str.parse::<Owner>().unwrap()),
+            )?);
+        }
+
+        let parent_data = self.inodes.get(parent).ok_or(libc::ENOENT)?;
+
+        match parent_data {
+            InodeData::Owner(owner) => {
+                if !Self::is_valid_repo(name_str) {
+                    return Err(libc::ENOENT);
                 }
-                VirtualNode::Repo { owner, repo, .. } => {
-                    let (gen_path, gen_id) = self
-                        .ensure_repo_materialized(&owner, &repo)
-                        .ok_or(libc::EIO)?;
-                    self.lookup_path_child(parent, &gen_path, gen_id, name)
+                let repo: Repo = name_str.parse().unwrap();
+                let key = RepoKey::new(owner, repo);
+                let commit = self.materialize_head(&key)?;
+                let root_tree = self
+                    .store
+                    .root_tree(&key, parse_oid(&commit)?)
+                    .map_err(|e| store_err_errno(&e))?;
+                Ok(self.inodes.get_or_alloc_virtual(
+                    parent,
+                    name_str,
+                    InodeData::Repo {
+                        key,
+                        selector: None,
+                        commit,
+                        root_tree: root_tree.to_string(),
+                    },
+                )?)
+            }
+            InodeData::RefOwner(owner) => {
+                if !Self::is_valid_repo(name_str) {
+                    return Err(libc::ENOENT);
                 }
-                VirtualNode::Root => Err(libc::ENOENT),
-            };
+                let repo: Repo = name_str.parse().unwrap();
+                let key = RepoKey::new(owner, repo);
+                Ok(self
+                    .inodes
+                    .get_or_alloc_virtual(parent, name_str, InodeData::RefRepo(key))?)
+            }
+            InodeData::RefRepo(key) => {
+                // Child is an encoded ref selector.
+                let raw = decode_ref(name.as_bytes()).ok_or(libc::ENOENT)?;
+                let commit = self.resolve_selector(&key, &raw)?;
+                let root_tree = self
+                    .store
+                    .root_tree(&key, parse_oid(&commit)?)
+                    .map_err(|e| store_err_errno(&e))?;
+                Ok(self.inodes.get_or_alloc_virtual(
+                    parent,
+                    name_str,
+                    InodeData::Repo {
+                        key,
+                        selector: Some(raw),
+                        commit,
+                        root_tree: root_tree.to_string(),
+                    },
+                )?)
+            }
+            // ---- commit-pinned path descent ----
+            InodeData::Repo {
+                key,
+                commit,
+                root_tree,
+                ..
+            } => {
+                let tree_oid = parse_oid(&root_tree)?;
+                self.lookup_path_child(parent, &key, &commit, tree_oid, &[], name)
+            }
+            InodeData::Path {
+                repo,
+                commit,
+                path,
+                oid,
+                kind,
+                ..
+            } => {
+                if kind != EntryKind::Tree {
+                    return Err(libc::ENOTDIR);
+                }
+                let tree_oid = parse_oid(&oid)?;
+                self.lookup_path_child(parent, &repo, &commit, tree_oid, &path, name)
+            }
+            // Root, ByRefRoot, RefOwner are handled by explicit arms above;
+            // nothing else should reach here.
+            _ => Err(libc::ENOENT),
         }
-
-        if InodeTable::is_virtual(parent) {
-            return Err(libc::ENOENT);
-        }
-
-        let parent_info = self.inodes.get(parent).ok_or(libc::ENOENT)?;
-        self.lookup_path_child(parent, &parent_info.path, parent_info.key.generation, name)
     }
 
-    fn list_real_children(
+    /// Look up a named child of a directory identified by its tree OID.
+    /// `prefix` is the parent path (repo-relative) of the directory.
+    fn lookup_path_child(
         &self,
-        parent_ino: u64,
-        dir_path: &Path,
-        generation: GenerationId,
-    ) -> Result<Vec<DirEntryInfo>, i32> {
-        let read_dir = std::fs::read_dir(dir_path).map_err(|e| io_errno(e, libc::EIO))?;
-        let mut entries = Vec::new();
+        parent: u64,
+        repo: &RepoKey,
+        commit: &str,
+        tree_oid: git2::Oid,
+        prefix: &[u8],
+        name: &OsStr,
+    ) -> Result<u64, i32> {
+        let entry = self
+            .store
+            .tree_entry(repo, tree_oid, name.as_bytes())
+            .map_err(|e| store_err_errno(&e))?
+            .ok_or(libc::ENOENT)?;
+        let child_path = join_path(prefix, name.as_bytes());
+        let key = PathKey {
+            repo: repo.clone(),
+            commit: commit.to_string(),
+            path: child_path,
+        };
+        Ok(self
+            .inodes
+            .get_or_alloc_path(key, entry.oid.to_string(), entry.kind, parent))
+    }
 
-        for entry in read_dir.flatten() {
-            let name = entry.file_name();
-            let child_path = dir_path.join(&name);
-            let Ok(metadata) = std::fs::symlink_metadata(&child_path) else {
-                continue;
-            };
-
-            let key = underlying_key_from_metadata(&metadata, generation);
-            let (child_ino, _) = self.inodes.get_or_insert(child_path, key, parent_ino);
-            entries.push(DirEntryInfo {
-                ino: child_ino,
-                kind: metadata_kind(&metadata),
-                name,
-            });
+    fn stat_inode(&self, ino: u64) -> Result<NodeAttr, i32> {
+        let data = self.inodes.get(ino).ok_or(libc::ENOENT)?;
+        match data {
+            InodeData::Root
+            | InodeData::ByRefRoot
+            | InodeData::Owner(_)
+            | InodeData::RefOwner(_)
+            | InodeData::RefRepo(_) => Ok(self.virtual_dir_attr(ino)),
+            InodeData::Repo { .. } => Ok(self.virtual_dir_attr(ino)),
+            InodeData::Path {
+                kind, oid, repo, ..
+            } => {
+                if kind == EntryKind::Tree {
+                    return Ok(self.virtual_dir_attr(ino));
+                }
+                if kind == EntryKind::Gitlink {
+                    return Ok(self.file_attr(ino, kind, 0));
+                }
+                // File or symlink: hydrate to learn the size (one-time,
+                // content-addressed and cached thereafter).
+                let blob_oid = parse_oid(&oid)?;
+                let (_path, size) = self
+                    .store
+                    .hydrate_blob(&repo, blob_oid)
+                    .map_err(|e| store_err_errno(&e))?;
+                Ok(self.file_attr(ino, kind, size))
+            }
         }
-
-        entries.sort_by(|a, b| {
-            a.name
-                .as_os_str()
-                .as_bytes()
-                .cmp(b.name.as_os_str().as_bytes())
-        });
-        Ok(entries)
     }
 
     fn list_children(&self, ino: u64) -> Result<Vec<DirEntryInfo>, i32> {
-        if ino == ROOT_INO {
-            let mut out = Vec::new();
-            for owner in self.list_cached_owners() {
-                if let Ok(owner_ino) = self.get_or_create_owner(&owner) {
+        let data = self.inodes.get(ino).ok_or(libc::ENOENT)?;
+        match data {
+            InodeData::Root => {
+                let mut out = vec![DirEntryInfo {
+                    ino: BY_REF_INO,
+                    kind: FsKind::Directory,
+                    name: OsString::from(BY_REF_ROOT),
+                }];
+                for owner in self.list_cached_owners() {
+                    let owner_ino = self.inodes.get_or_alloc_virtual(
+                        ino,
+                        &owner,
+                        InodeData::Owner(owner.parse::<Owner>().unwrap()),
+                    )?;
                     out.push(DirEntryInfo {
                         ino: owner_ino,
                         kind: FsKind::Directory,
                         name: OsString::from(owner),
                     });
                 }
+                Ok(out)
             }
-            return Ok(out);
-        }
-
-        if let Some(node) = self.virtual_nodes.get(&ino).map(|n| n.clone()) {
-            return match node {
-                VirtualNode::Root => Ok(Vec::new()),
-                VirtualNode::Owner(owner) => {
-                    let mut out = Vec::new();
-                    for repo in self.list_cached_repos(&owner) {
-                        if let Ok(repo_ino) = self.get_or_create_repo(ino, &owner, &repo) {
-                            out.push(DirEntryInfo {
-                                ino: repo_ino,
-                                kind: FsKind::Directory,
-                                name: OsString::from(repo),
-                            });
+            InodeData::ByRefRoot => {
+                let mut out = Vec::new();
+                for owner in self.list_cached_owners() {
+                    let owner_ino = self.inodes.get_or_alloc_virtual(
+                        ino,
+                        &owner,
+                        InodeData::RefOwner(owner.parse::<Owner>().unwrap()),
+                    )?;
+                    out.push(DirEntryInfo {
+                        ino: owner_ino,
+                        kind: FsKind::Directory,
+                        name: OsString::from(owner),
+                    });
+                }
+                Ok(out)
+            }
+            InodeData::Owner(owner) => {
+                let mut out = Vec::new();
+                for repo in self.list_cached_repos(owner.as_str()) {
+                    let name = repo.clone();
+                    let key = RepoKey::new(owner.clone(), name.parse::<Repo>().unwrap());
+                    // Don't clone on a mere listing of cached repos; only show
+                    // repos whose mirror already exists (list_cached_repos
+                    // scans the mirror dir, so this holds).
+                    let ino = self
+                        .inodes
+                        .get_or_alloc_virtual(ino, &repo, InodeData::RefRepo(key))
+                        .map_err(|_| libc::EIO)?; // shouldn't run out of vnodes for small lists
+                    out.push(DirEntryInfo {
+                        ino,
+                        kind: FsKind::Directory,
+                        name: OsString::from(repo),
+                    });
+                }
+                Ok(out)
+            }
+            InodeData::RefOwner(owner) => {
+                let mut out = Vec::new();
+                for repo in self.list_cached_repos(owner.as_str()) {
+                    let key = RepoKey::new(owner.clone(), repo.parse::<Repo>().unwrap());
+                    let ino =
+                        self.inodes
+                            .get_or_alloc_virtual(ino, &repo, InodeData::RefRepo(key))?;
+                    out.push(DirEntryInfo {
+                        ino,
+                        kind: FsKind::Directory,
+                        name: OsString::from(repo),
+                    });
+                }
+                Ok(out)
+            }
+            InodeData::RefRepo(key) => {
+                // Listing refs requires the mirror to exist.
+                self.materialize_head(&key)?;
+                let mut refs = self
+                    .store
+                    .list_branches(&key)
+                    .map_err(|e| store_err_errno(&e))?;
+                refs.extend(
+                    self.store
+                        .list_tags(&key)
+                        .map_err(|e| store_err_errno(&e))?,
+                );
+                refs.sort();
+                refs.dedup();
+                let mut out = Vec::new();
+                for raw in refs {
+                    let enc = encode_ref(&raw);
+                    let commit = match self.store.resolve_revision(&key, &raw) {
+                        Ok(c) => c.to_string(),
+                        Err(e) => {
+                            log::warn!("resolve {key} {raw} for listing: {e}");
+                            continue;
                         }
-                    }
-                    Ok(out)
+                    };
+                    let root_tree = match self.store.root_tree(&key, parse_oid(&commit)?) {
+                        Ok(t) => t.to_string(),
+                        Err(e) => {
+                            log::warn!("root_tree {key} {commit}: {e}");
+                            continue;
+                        }
+                    };
+                    let ino = self.inodes.get_or_alloc_virtual(
+                        ino,
+                        &enc,
+                        InodeData::Repo {
+                            key: key.clone(),
+                            selector: Some(raw),
+                            commit,
+                            root_tree,
+                        },
+                    )?;
+                    out.push(DirEntryInfo {
+                        ino,
+                        kind: FsKind::Directory,
+                        name: OsString::from(enc),
+                    });
                 }
-                VirtualNode::Repo { owner, repo, .. } => {
-                    let (gen_path, gen_id) = self
-                        .ensure_repo_materialized(&owner, &repo)
-                        .ok_or(libc::EIO)?;
-                    self.list_real_children(ino, &gen_path, gen_id)
+                Ok(out)
+            }
+            InodeData::Repo {
+                key,
+                commit,
+                root_tree,
+                ..
+            } => {
+                let tree_oid = parse_oid(&root_tree)?;
+                self.list_tree_children(ino, &key, &commit, tree_oid, &[])
+            }
+            InodeData::Path {
+                repo,
+                commit,
+                path,
+                oid,
+                kind,
+                ..
+            } => {
+                if kind != EntryKind::Tree {
+                    return Err(libc::ENOTDIR);
                 }
-            };
+                let tree_oid = parse_oid(&oid)?;
+                self.list_tree_children(ino, &repo, &commit, tree_oid, &path)
+            }
         }
-
-        if InodeTable::is_virtual(ino) {
-            return Err(libc::ENOENT);
-        }
-
-        let info = self.inodes.get(ino).ok_or(libc::ENOENT)?;
-        let metadata = std::fs::symlink_metadata(&info.path).map_err(|e| io_errno(e, libc::EIO))?;
-        if !metadata.is_dir() {
-            return Err(libc::ENOTDIR);
-        }
-
-        self.list_real_children(ino, &info.path, info.key.generation)
     }
 
-    #[cfg(target_os = "linux")]
+    fn list_tree_children(
+        &self,
+        parent_ino: u64,
+        repo: &RepoKey,
+        commit: &str,
+        tree_oid: git2::Oid,
+        prefix: &[u8],
+    ) -> Result<Vec<DirEntryInfo>, i32> {
+        let entries = self
+            .store
+            .tree_entries(repo, tree_oid)
+            .map_err(|e| store_err_errno(&e))?;
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let child_path = join_path(prefix, &entry.name);
+            let key = PathKey {
+                repo: repo.clone(),
+                commit: commit.to_string(),
+                path: child_path,
+            };
+            let ino =
+                self.inodes
+                    .get_or_alloc_path(key, entry.oid.to_string(), entry.kind, parent_ino);
+            out.push(DirEntryInfo {
+                ino,
+                kind: entry_kind_to_fs(entry.kind),
+                name: OsString::from_vec(entry.name.clone()),
+            });
+        }
+        out.sort_by(|a, b| {
+            a.name
+                .as_os_str()
+                .as_bytes()
+                .cmp(b.name.as_os_str().as_bytes())
+        });
+        Ok(out)
+    }
+
     fn parent_inode(&self, ino: u64) -> u64 {
         if ino == ROOT_INO {
             return ROOT_INO;
         }
-
-        if let Some(node) = self.virtual_nodes.get(&ino) {
-            return match node.value() {
-                VirtualNode::Root => ROOT_INO,
-                VirtualNode::Owner(_) => ROOT_INO,
-                VirtualNode::Repo { parent, .. } => *parent,
-            };
+        if ino == BY_REF_INO {
+            return ROOT_INO;
         }
-
-        self.inodes.get(ino).map(|i| i.parent).unwrap_or(ROOT_INO)
+        match self.inodes.get(ino) {
+            Some(InodeData::Owner(_)) => ROOT_INO,
+            Some(InodeData::RefOwner(_)) => BY_REF_INO,
+            Some(InodeData::RefRepo(_)) => {
+                // parent is the RefOwner; we don't store it on the node. Walk
+                // back via the virtual_children map is overkill; return
+                // BY_REF_INO as a safe ancestor (nfs readdir ".." only).
+                BY_REF_INO
+            }
+            Some(InodeData::Repo { .. }) => {
+                // Top-level repo -> Owner; by-ref selector -> RefRepo. Without
+                // storing parent, approximate: return ROOT_INO. FUSE readdir
+                // uses parent_inode for ".."; a wrong-but-valid ancestor is
+                // tolerable. We store parent on Path nodes precisely.
+                ROOT_INO
+            }
+            Some(InodeData::Path { parent, .. }) => parent,
+            _ => ROOT_INO,
+        }
     }
 
     fn readlink_bytes(&self, ino: u64) -> Result<Vec<u8>, i32> {
-        if InodeTable::is_virtual(ino) {
-            return Err(libc::EINVAL);
+        let data = self.inodes.get(ino).ok_or(libc::ENOENT)?;
+        match data {
+            InodeData::Path {
+                kind, oid, repo, ..
+            } if kind == EntryKind::Symlink => {
+                let blob_oid = parse_oid(&oid)?;
+                let (path, _size) = self
+                    .store
+                    .hydrate_blob(&repo, blob_oid)
+                    .map_err(|e| store_err_errno(&e))?;
+                Ok(std::fs::read(&path).map_err(|e| io_errno(e, libc::EIO))?)
+            }
+            _ => Err(libc::EINVAL),
         }
+    }
 
-        let info = self.inodes.get(ino).ok_or(libc::ENOENT)?;
-        let target = std::fs::read_link(&info.path).map_err(|e| io_errno(e, libc::EIO))?;
-        Ok(target.into_os_string().into_vec())
+    /// Hydrate (if needed) and open a file's cached blob for offset reads.
+    fn open_blob(&self, ino: u64) -> Result<File, i32> {
+        let data = self.inodes.get(ino).ok_or(libc::ENOENT)?;
+        match data {
+            InodeData::Path {
+                kind, oid, repo, ..
+            } if kind == EntryKind::Blob
+                || kind == EntryKind::Executable
+                || kind == EntryKind::Symlink =>
+            {
+                let blob_oid = parse_oid(&oid)?;
+                let (path, _size) = self
+                    .store
+                    .hydrate_blob(&repo, blob_oid)
+                    .map_err(|e| store_err_errno(&e))?;
+                File::open(&path).map_err(|e| io_errno(e, libc::EIO))
+            }
+            InodeData::Path {
+                kind: EntryKind::Gitlink,
+                ..
+            } => {
+                // Submodule gitlink: serve as an empty file.
+                File::open("/dev/null").map_err(|e| io_errno(e, libc::EIO))
+            }
+            _ => Err(libc::EISDIR),
+        }
     }
 
     #[cfg(target_os = "macos")]
     fn read_file_range(&self, ino: u64, offset: u64, size: u32) -> Result<(Vec<u8>, bool), i32> {
-        if InodeTable::is_virtual(ino) {
+        if InodeTable::is_virtual_ino(ino) {
             return Err(libc::EISDIR);
         }
-
-        let info = self.inodes.get(ino).ok_or(libc::ENOENT)?;
-        let mut file = File::open(&info.path).map_err(|e| io_errno(e, libc::EIO))?;
+        let mut file = self.open_blob(ino)?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| io_errno(e, libc::EIO))?;
-
         let mut buf = vec![0u8; size as usize];
         let n = file.read(&mut buf).map_err(|e| io_errno(e, libc::EIO))?;
         buf.truncate(n);
         Ok((buf, n < size as usize))
     }
+
+    #[cfg(target_os = "linux")]
+    fn ttl_for_inode(&self, ino: u64) -> Duration {
+        match self.inodes.get(ino) {
+            Some(InodeData::Repo { selector, .. }) => {
+                // Commit-pinned content is immutable.
+                if selector
+                    .as_ref()
+                    .is_some_and(|s| Self::is_commit_oid_selector(s))
+                    || selector.is_none()
+                {
+                    // default HEAD alias is mutable → short; named ref short;
+                    // commit-OID selector long.
+                    if selector
+                        .as_ref()
+                        .is_some_and(|s| Self::is_commit_oid_selector(s))
+                    {
+                        COMMIT_TTL
+                    } else {
+                        REF_TTL
+                    }
+                } else {
+                    REF_TTL
+                }
+            }
+            Some(InodeData::Path { .. }) => COMMIT_TTL,
+            _ => VIRTUAL_TTL,
+        }
+    }
+
+    /// TTL for a lookup reply, based on what was resolved.
+    #[cfg(target_os = "linux")]
+    fn lookup_ttl(&self, parent: u64, name: &str) -> Duration {
+        // Default-branch repo node (under Owner): short.
+        // Ref selector under RefRepo: short unless it's a commit OID.
+        // Everything else discovery: virtual.
+        let parent_data = self.inodes.get(parent);
+        match parent_data.as_ref().map(|d| d) {
+            Some(InodeData::Owner(_)) => REF_TTL,
+            Some(InodeData::RefRepo(_)) => {
+                if Self::is_commit_oid_selector(name) {
+                    COMMIT_TTL
+                } else {
+                    REF_TTL
+                }
+            }
+            _ => VIRTUAL_TTL,
+        }
+    }
+}
+
+fn join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+    if prefix.is_empty() {
+        return name.to_vec();
+    }
+    let mut out = Vec::with_capacity(prefix.len() + 1 + name.len());
+    out.extend_from_slice(prefix);
+    out.push(b'/');
+    out.extend_from_slice(name);
+    out
+}
+
+fn parse_oid(s: &str) -> Result<git2::Oid, i32> {
+    git2::Oid::from_str(s).map_err(|_| libc::EIO)
 }
 
 #[cfg(target_os = "linux")]
@@ -611,7 +827,6 @@ impl GhFs {
     /// Mount the filesystem at the given path.
     pub fn mount(self, mountpoint: &Path, _shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
         let options = vec![MountOption::FSName("ghfs".to_string()), MountOption::RO];
-
         fuser::mount2(self, mountpoint, &options)?;
         Ok(())
     }
@@ -630,13 +845,9 @@ impl GhFs {
 
         runtime.block_on(async move {
             let handle = nfs::mount_nfs(self, opts).await?;
-
-            // The control socket and signal handler set shutdown. Also notice
-            // an explicit host-side unmount so the daemon can exit cleanly.
             while !shutdown.load(Ordering::SeqCst) && nfs::is_mount_active(handle.mountpoint()) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-
             drop(handle);
             Ok(())
         })
@@ -655,7 +866,10 @@ impl Filesystem for GhFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.lookup_inode(parent, name) {
             Ok(ino) => match self.stat_inode(ino) {
-                Ok(attr) => reply.entry(&self.lookup_ttl(parent, ino), &attr.to_fuse_attr(), 0),
+                Ok(attr) => {
+                    let ttl = self.lookup_ttl(parent, name.to_str().unwrap_or(""));
+                    reply.entry(&ttl, &attr.to_fuse_attr(), 0)
+                }
                 Err(err) => reply.error(err),
             },
             Err(err) => reply.error(err),
@@ -674,7 +888,6 @@ impl Filesystem for GhFs {
             reply.error(libc::EINVAL);
             return;
         }
-
         let parent = self.parent_inode(ino);
         let mut entries = vec![
             DirEntryInfo {
@@ -688,7 +901,6 @@ impl Filesystem for GhFs {
                 name: OsString::from(".."),
             },
         ];
-
         match self.list_children(ino) {
             Ok(mut children) => entries.append(&mut children),
             Err(err) => {
@@ -696,7 +908,6 @@ impl Filesystem for GhFs {
                 return;
             }
         }
-
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             if reply.add(
                 entry.ino,
@@ -707,31 +918,19 @@ impl Filesystem for GhFs {
                 break;
             }
         }
-
         reply.ok();
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let access_mode = flags & libc::O_ACCMODE;
-        if access_mode != libc::O_RDONLY {
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
             reply.error(libc::EROFS);
             return;
         }
-
-        if InodeTable::is_virtual(ino) {
+        if InodeTable::is_virtual_ino(ino) {
             reply.error(libc::EISDIR);
             return;
         }
-
-        let info = match self.inodes.get(ino) {
-            Some(info) => info,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        match File::open(&info.path) {
+        match self.open_blob(ino) {
             Ok(file) => {
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
                 match self.open_files.lock() {
@@ -742,7 +941,7 @@ impl Filesystem for GhFs {
                     Err(_) => reply.error(libc::EIO),
                 }
             }
-            Err(err) => reply.error(io_errno(err, libc::EIO)),
+            Err(err) => reply.error(err),
         }
     }
 
@@ -761,7 +960,6 @@ impl Filesystem for GhFs {
             reply.error(libc::EINVAL);
             return;
         }
-
         let mut files = match self.open_files.lock() {
             Ok(files) => files,
             Err(_) => {
@@ -769,7 +967,6 @@ impl Filesystem for GhFs {
                 return;
             }
         };
-
         let file = match files.get_mut(&fh) {
             Some(file) => file,
             None => {
@@ -777,12 +974,10 @@ impl Filesystem for GhFs {
                 return;
             }
         };
-
         if let Err(err) = file.seek(SeekFrom::Start(offset as u64)) {
             reply.error(io_errno(err, libc::EIO));
             return;
         }
-
         let mut buf = vec![0u8; size as usize];
         match file.read(&mut buf) {
             Ok(n) => reply.data(&buf[..n]),
@@ -825,51 +1020,43 @@ impl Filesystem for GhFs {
         size: u32,
         reply: ReplyXattr,
     ) {
-        if !self.inode_exists(ino) {
+        if self.inodes.get(ino).is_none() {
             reply.error(libc::ENOENT);
             return;
         }
-
         let Some(name_str) = name.to_str() else {
             reply.error(libc::ENODATA);
             return;
         };
-
         if name_str != FINDER_INFO_XATTR {
             reply.error(libc::ENODATA);
             return;
         }
-
         let data = [0u8; FINDER_INFO_SIZE];
         if size == 0 {
             reply.size(data.len() as u32);
             return;
         }
-
         if size < data.len() as u32 {
             reply.error(libc::ERANGE);
             return;
         }
-
         reply.data(&data);
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        if !self.inode_exists(ino) {
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+        if self.inodes.get(ino).is_none() {
             reply.error(libc::ENOENT);
             return;
         }
-
         if size == 0 {
             reply.size(FINDER_INFO_XATTR_LIST.len() as u32);
             return;
         }
-
         if size < FINDER_INFO_XATTR_LIST.len() as u32 {
             reply.error(libc::ERANGE);
             return;
         }
-
         reply.data(FINDER_INFO_XATTR_LIST);
     }
 

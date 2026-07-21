@@ -66,15 +66,12 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
                 .parse()
                 .map_err(|e| RpcError::invalid_params(format!("invalid repo: {}", e)))?;
 
-            let gen_ref = ctx
+            let commit = ctx
                 .worker
                 .sync(key)
                 .map_err(|e| RpcError::internal(e.to_string()))?;
 
-            Ok(Response::Sync(SyncResult {
-                generation: gen_ref.generation.as_u64(),
-                commit: gen_ref.commit,
-            }))
+            Ok(Response::Sync(SyncResult { commit }))
         }
 
         Request::Gc => {
@@ -98,12 +95,9 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
                 .map(|r| RepoInfo {
                     owner: r.owner,
                     repo: r.repo,
-                    generation: r.current_generation,
                     commit: r.head_commit,
                     last_sync: r.last_sync_at.map(format_timestamp),
                     last_access: r.last_access_at.map(format_timestamp),
-                    generation_count: r.generation_count,
-                    commit_count: r.commit_count,
                     total_size_bytes: r.total_size_bytes,
                 })
                 .collect();

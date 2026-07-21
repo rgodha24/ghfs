@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
-use crate::cache::{CachePaths, ManagedCache};
+use crate::cache::CachePaths;
 use crate::fs::GhFs;
+use crate::store::Store;
 
 /// Default mount point on Linux.
 #[cfg(target_os = "linux")]
@@ -169,7 +170,7 @@ impl Daemon {
 
         // Ensure cache directories exist
         std::fs::create_dir_all(cache_paths.mirrors_dir())?;
-        std::fs::create_dir_all(cache_paths.worktrees_dir())?;
+        std::fs::create_dir_all(cache_paths.blobs_dir())?;
         std::fs::create_dir_all(cache_paths.locks_dir())?;
 
         // Open state database
@@ -196,11 +197,11 @@ impl Daemon {
         // Ensure mount point exists and recover from disconnected stale mounts.
         ensure_mount_point_ready(&self.mount_point)?;
 
-        // Create managed cache for the worker
-        let managed_cache = ManagedCache::new(self.cache_paths.clone(), Arc::clone(&self.state));
+        // Create the object-backed store shared by worker and fs backend.
+        let store = Store::new(self.cache_paths.clone());
 
         // Spawn worker thread
-        let worker = Arc::new(WorkerHandle::spawn(managed_cache));
+        let worker = Arc::new(WorkerHandle::spawn(store.clone()));
         log::info!("Worker thread started");
 
         // Spawn socket server
@@ -234,7 +235,7 @@ impl Daemon {
         .expect("failed to set signal handler");
 
         // Create and mount filesystem backend.
-        let fs = GhFs::new(Arc::clone(&worker), self.cache_paths.clone());
+        let fs = GhFs::new(store, Arc::clone(&worker));
 
         #[cfg(target_os = "linux")]
         log::info!("Mounting Linux FUSE filesystem");

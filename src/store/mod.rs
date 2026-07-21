@@ -9,11 +9,13 @@
 pub mod blob;
 pub mod git;
 pub mod ref_selector;
+pub mod store;
 pub mod tree;
 
 pub use blob::{BlobCache, BlobError, Hydrator};
 pub use git::{GitCli, GitError, resolve_head, resolve_revision};
 pub use ref_selector::{BY_REF_ROOT, RefSelector, VirtualNode, decode_ref, encode_ref};
+pub use store::{Store, StoreError};
 pub use tree::{EntryKind, TreeCache, TreeEntry, TreeError, TreeReader};
 
 /// Best-effort redaction of embedded credentials from a git error string.

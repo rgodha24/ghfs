@@ -83,6 +83,7 @@ pub fn validate_selector(value: &str) -> Result<(), GitError> {
 /// Libgit2 does not reliably perform promisor lazy fetches, so partial-clone
 /// network operations go through the CLI. All read operations (ref
 /// resolution, tree walking) use libgit2 instead.
+#[derive(Clone)]
 pub struct GitCli {
     git_path: String,
 }

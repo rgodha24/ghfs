@@ -39,7 +39,6 @@ pub struct StatusResult {
 /// Sync response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResult {
-    pub generation: u64,
     pub commit: String,
 }
 
@@ -56,14 +55,9 @@ pub struct GcResult {
 pub struct RepoInfo {
     pub owner: String,
     pub repo: String,
-    pub generation: Option<u64>,
     pub commit: Option<String>,
     pub last_sync: Option<String>,   // Human-readable timestamp
     pub last_access: Option<String>, // Human-readable timestamp
-    #[serde(default)]
-    pub generation_count: u64,
-    #[serde(default)]
-    pub commit_count: u64,
     #[serde(default)]
     pub total_size_bytes: u64,
 }

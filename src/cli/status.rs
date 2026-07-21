@@ -154,11 +154,12 @@ pub fn print_status() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         for repo in &list.repos {
             let name = format!("{}/{}", repo.owner, repo.repo);
-            let gen_str = repo
-                .generation
-                .map(|g| format!("gen {}", g))
-                .unwrap_or_else(|| "not synced".to_string());
-            println!("  {:<40} {}", name, gen_str);
+            let commit_str = repo
+                .commit
+                .as_ref()
+                .map(|c| if c.len() > 12 { &c[..12] } else { c.as_str() })
+                .unwrap_or("not synced");
+            println!("  {:<40} {}", name, commit_str);
         }
     }
     println!();

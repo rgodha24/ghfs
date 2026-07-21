@@ -150,9 +150,8 @@ fn cmd_sync(repo: &str) -> Result<(), Box<dyn std::error::Error>> {
     let result = client.sync(repo)?;
 
     println!("Synced successfully");
-    println!("  Generation: {}", result.generation);
     println!(
-        "  Commit:     {}",
+        "  Commit: {}",
         if result.commit.len() > 12 {
             &result.commit[..12]
         } else {

@@ -1,30 +1,41 @@
 //! Background worker thread for git operations.
 //!
-//! This module provides a worker thread that handles git operations (clone, fetch,
-//! worktree creation) off the mount backend thread to avoid blocking filesystem operations.
+//! Offloads network operations (blobless clone/fetch, ref resolution) from
+//! the mount backend thread so filesystem operations don't block on the
+//! promisor. Operates entirely against the [`crate::store::Store`].
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::sync::mpsc as oneshot;
 use std::thread::{self, JoinHandle};
 
-use crate::cache::{CacheError, GenerationRef, ManagedCache, NegativeCache};
+use crate::cache::NegativeCache;
+use crate::store::{Store, StoreError};
 use crate::types::RepoKey;
 
 /// Requests the worker can handle.
 pub enum WorkerRequest {
-    /// Materialize a repo (blocking - mount backend needs the result).
+    /// Ensure the repo mirror exists and resolve the default-branch (HEAD)
+    /// commit. Returns the commit OID hex string.
     Materialize {
         repo: RepoKey,
-        reply: oneshot::Sender<Result<GenerationRef, CacheError>>,
+        reply: oneshot::Sender<Result<String, StoreError>>,
     },
 
-    /// Refresh a repo in background (fire and forget).
+    /// Ensure the repo mirror exists and resolve an arbitrary ref selector to
+    /// a commit OID hex string.
+    Resolve {
+        repo: RepoKey,
+        selector: String,
+        reply: oneshot::Sender<Result<String, StoreError>>,
+    },
+
+    /// Background refresh (fire and forget): re-fetch the mirror's refs.
     Refresh { repo: RepoKey },
 
-    /// Force sync (from CLI, needs result for response).
+    /// Force sync (from CLI): re-fetch and return the HEAD commit.
     Sync {
         repo: RepoKey,
-        reply: oneshot::Sender<Result<GenerationRef, CacheError>>,
+        reply: oneshot::Sender<Result<String, StoreError>>,
     },
 
     /// Shutdown the worker.
@@ -34,17 +45,15 @@ pub enum WorkerRequest {
 /// Background worker that processes git operations.
 pub struct Worker {
     receiver: Receiver<WorkerRequest>,
-    cache: ManagedCache,
-    /// Cache of repos that are known not to exist.
+    store: Store,
     negative_cache: NegativeCache,
 }
 
 impl Worker {
-    /// Create a new worker with the given receiver and cache.
-    pub fn new(receiver: Receiver<WorkerRequest>, cache: ManagedCache) -> Self {
+    pub fn new(receiver: Receiver<WorkerRequest>, store: Store) -> Self {
         Self {
             receiver,
-            cache,
+            store,
             negative_cache: NegativeCache::new(),
         }
     }
@@ -52,54 +61,51 @@ impl Worker {
     /// Run the worker loop (blocks until Shutdown).
     pub fn run(self) {
         log::info!("Worker thread started");
-
         loop {
             match self.receiver.recv() {
                 Ok(WorkerRequest::Materialize { repo, reply }) => {
-                    // Check negative cache first
                     if self.negative_cache.contains(&repo) {
-                        log::debug!("Repo {} is in negative cache, skipping", repo);
-                        let _ = reply.send(Err(CacheError::RepoNotFound(repo.to_string())));
+                        let _ = reply.send(Err(StoreError::RepoNotFound(repo.to_string())));
                         continue;
                     }
-
-                    log::debug!("Materializing repo: {}", repo);
-                    let result = self.cache.ensure_current(&repo);
-
-                    // If materialization failed, check if we should add to negative cache
-                    if let Err(ref e) = result {
-                        log::debug!("Materialization failed for {}: {}", repo, e);
-                        // Only check for not-found on git errors (clone failures)
-                        if matches!(e, CacheError::Git(_)) {
-                            self.negative_cache.insert_if_not_exists(&repo);
+                    let result = self.store.resolve_head(&repo).map(|oid| oid.to_string());
+                    if let Err(StoreError::Git(crate::store::GitError::CloneError(_))) = &result {
+                        if self.negative_cache.insert_if_not_exists(&repo) {
+                            // confirmed not found; error already returned
                         }
                     }
-
                     let _ = reply.send(result);
                 }
+                Ok(WorkerRequest::Resolve {
+                    repo,
+                    selector,
+                    reply,
+                }) => {
+                    let _ = reply.send(
+                        self.store
+                            .resolve_revision(&repo, &selector)
+                            .map(|oid| oid.to_string()),
+                    );
+                }
                 Ok(WorkerRequest::Refresh { repo }) => {
-                    // Skip refresh for repos in negative cache
                     if self.negative_cache.contains(&repo) {
-                        log::debug!("Repo {} is in negative cache, skipping refresh", repo);
                         continue;
                     }
-
-                    log::debug!("Background refresh for repo: {}", repo);
-                    if let Err(e) = self.cache.ensure_current(&repo) {
-                        log::warn!("Background refresh failed for {}: {}", repo, e);
+                    if let Err(e) = self.store.refresh(&repo) {
+                        log::warn!("Background refresh failed for {repo}: {e}");
                     }
                 }
                 Ok(WorkerRequest::Sync { repo, reply }) => {
-                    log::debug!("Force sync for repo: {}", repo);
-                    let result = self.cache.force_refresh(&repo);
-                    let _ = reply.send(result);
+                    let _ = reply.send(match self.store.refresh(&repo) {
+                        Ok(()) => self.store.resolve_head(&repo).map(|oid| oid.to_string()),
+                        Err(e) => Err(e),
+                    });
                 }
                 Ok(WorkerRequest::Shutdown) => {
                     log::info!("Worker thread shutting down");
                     break;
                 }
                 Err(_) => {
-                    // Channel closed, exit
                     log::info!("Worker channel closed, exiting");
                     break;
                 }
@@ -116,50 +122,58 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     /// Spawn the worker thread.
-    pub fn spawn(cache: ManagedCache) -> Self {
-        let (sender, receiver) = bounded(100); // Buffer up to 100 requests
-
-        let worker = Worker::new(receiver, cache);
+    pub fn spawn(store: Store) -> Self {
+        let (sender, receiver) = bounded(100);
+        let worker = Worker::new(receiver, store);
         let thread = thread::Builder::new()
             .name("ghfs-worker".to_string())
             .spawn(move || worker.run())
             .expect("failed to spawn worker thread");
-
         Self {
             sender,
             thread: Some(thread),
         }
     }
 
-    /// Get a clone of the sender for submitting work.
     pub fn sender(&self) -> Sender<WorkerRequest> {
         self.sender.clone()
     }
 
-    /// Request materialization (blocking until complete).
-    pub fn materialize(&self, repo: RepoKey) -> Result<GenerationRef, CacheError> {
+    /// Ensure the mirror exists and resolve HEAD.
+    pub fn materialize(&self, repo: RepoKey) -> Result<String, StoreError> {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(WorkerRequest::Materialize { repo, reply: tx })
-            .map_err(|_| CacheError::LockFailed)?;
-        rx.recv().map_err(|_| CacheError::LockFailed)?
+            .map_err(|_| StoreError::LockFailed)?;
+        rx.recv().map_err(|_| StoreError::LockFailed)?
     }
 
-    /// Request background refresh (non-blocking).
+    /// Ensure the mirror exists and resolve a ref selector.
+    pub fn resolve(&self, repo: RepoKey, selector: String) -> Result<String, StoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(WorkerRequest::Resolve {
+                repo,
+                selector,
+                reply: tx,
+            })
+            .map_err(|_| StoreError::LockFailed)?;
+        rx.recv().map_err(|_| StoreError::LockFailed)?
+    }
+
     pub fn refresh(&self, repo: RepoKey) {
         let _ = self.sender.send(WorkerRequest::Refresh { repo });
     }
 
-    /// Request forced sync (blocking until complete).
-    pub fn sync(&self, repo: RepoKey) -> Result<GenerationRef, CacheError> {
+    /// Force refresh and return the HEAD commit.
+    pub fn sync(&self, repo: RepoKey) -> Result<String, StoreError> {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(WorkerRequest::Sync { repo, reply: tx })
-            .map_err(|_| CacheError::LockFailed)?;
-        rx.recv().map_err(|_| CacheError::LockFailed)?
+            .map_err(|_| StoreError::LockFailed)?;
+        rx.recv().map_err(|_| StoreError::LockFailed)?
     }
 
-    /// Shutdown the worker.
     pub fn shutdown(&mut self) {
         let _ = self.sender.send(WorkerRequest::Shutdown);
         if let Some(thread) = self.thread.take() {
