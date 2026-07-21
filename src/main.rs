@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod fs;
 pub mod protocol;
 pub mod service;
+pub mod store;
 pub mod types;
 
 use clap::{Parser, Subcommand};
