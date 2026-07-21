@@ -38,6 +38,7 @@ pub struct Context {
     pub cache_paths: CachePaths,
     pub start_time: Instant,
     pub mount_point: String,
+    pub shutdown: Arc<AtomicBool>,
 }
 
 /// Handle a single JSON-RPC request.
@@ -116,7 +117,10 @@ fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError>
         })),
 
         Request::Stop => {
-            // Trigger unmount to unblock the filesystem backend loop.
+            ctx.shutdown.store(true, Ordering::SeqCst);
+            // FUSE blocks in fuser, so Linux still needs a host-side unmount.
+            // The macOS NFS handle observes shutdown and unmounts via Drop.
+            #[cfg(target_os = "linux")]
             super::spawn_unmount(ctx.mount_point.clone());
             Ok(Response::Ok(()))
         }
@@ -212,6 +216,7 @@ impl SocketServerHandle {
             cache_paths,
             start_time: Instant::now(),
             mount_point,
+            shutdown: Arc::clone(&shutdown),
         });
 
         let shutdown_clone = shutdown.clone();

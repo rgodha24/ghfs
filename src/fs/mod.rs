@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -28,16 +28,9 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyXattr, Request,
 };
 
-#[cfg(target_os = "macos")]
-use async_trait::async_trait;
-#[cfg(target_os = "macos")]
-use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
-};
-#[cfg(target_os = "macos")]
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
-
 mod inode;
+#[cfg(target_os = "macos")]
+mod nfs;
 
 pub use inode::{
     InodeInfo, InodeTable, PASSTHROUGH_INO_START, ROOT_INO, UnderlyingKey, VIRTUAL_INO_END,
@@ -181,53 +174,6 @@ impl NodeAttr {
             rdev: self.rdev,
             blksize: self.blksize,
             flags: 0,
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn system_time_to_nfstime(time: SystemTime) -> nfstime3 {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(dur) => nfstime3 {
-            seconds: dur.as_secs().min(u32::MAX as u64) as u32,
-            nseconds: dur.subsec_nanos(),
-        },
-        Err(_) => nfstime3 {
-            seconds: 0,
-            nseconds: 0,
-        },
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn kind_to_nfs(kind: FsKind) -> ftype3 {
-    match kind {
-        FsKind::Directory => ftype3::NF3DIR,
-        FsKind::RegularFile => ftype3::NF3REG,
-        FsKind::Symlink => ftype3::NF3LNK,
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl NodeAttr {
-    fn to_nfs_attr(&self) -> fattr3 {
-        fattr3 {
-            ftype: kind_to_nfs(self.kind),
-            mode: self.perm as u32,
-            nlink: self.nlink,
-            uid: self.uid,
-            gid: self.gid,
-            size: self.size,
-            used: self.size,
-            rdev: specdata3 {
-                specdata1: self.rdev,
-                specdata2: 0,
-            },
-            fsid: 1,
-            fileid: self.ino,
-            atime: system_time_to_nfstime(self.atime),
-            mtime: system_time_to_nfstime(self.mtime),
-            ctime: system_time_to_nfstime(self.ctime),
         }
     }
 }
@@ -663,7 +609,7 @@ impl GhFs {
 #[cfg(target_os = "linux")]
 impl GhFs {
     /// Mount the filesystem at the given path.
-    pub fn mount(self, mountpoint: &Path) -> std::io::Result<()> {
+    pub fn mount(self, mountpoint: &Path, _shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
         let options = vec![MountOption::FSName("ghfs".to_string()), MountOption::RO];
 
         fuser::mount2(self, mountpoint, &options)?;
@@ -672,137 +618,29 @@ impl GhFs {
 }
 
 #[cfg(target_os = "macos")]
-const DEFAULT_NFS_PORT: u16 = 11111;
-#[cfg(target_os = "macos")]
-const MAX_NFS_PORT_SCAN: u16 = 100;
-
-#[cfg(target_os = "macos")]
 impl GhFs {
-    /// Mount the filesystem at the given path using an in-process NFSv3 server.
-    pub fn mount(self, mountpoint: &Path) -> std::io::Result<()> {
+    /// Mount with smfs-core's NFS listener and RAII mount lifecycle.
+    pub fn mount(self, mountpoint: &Path, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
         std::fs::create_dir_all(mountpoint)?;
-        let mountpoint = std::fs::canonicalize(mountpoint).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to canonicalize mountpoint {}: {e}",
-                    mountpoint.display()
-                ),
-            )
-        })?;
-
+        let opts = nfs::MountOpts::new(mountpoint.to_path_buf());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| std::io::Error::other(format!("failed to start tokio runtime: {e}")))?;
 
-        runtime.block_on(self.mount_nfs_foreground(mountpoint))
-    }
+        runtime.block_on(async move {
+            let handle = nfs::mount_nfs(self, opts).await?;
 
-    async fn mount_nfs_foreground(self, mountpoint: PathBuf) -> std::io::Result<()> {
-        use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-
-        let port = find_free_nfs_port(DEFAULT_NFS_PORT)?;
-        let bind_addr = format!("127.0.0.1:{port}");
-        let listener = NFSTcpListener::bind(&bind_addr, self).await.map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed to bind NFS listener on {bind_addr}: {e}"),
-            )
-        })?;
-
-        let server_task = tokio::spawn(async move {
-            if let Err(e) = listener.handle_forever().await {
-                log::error!("NFS server task ended unexpectedly: {e}");
+            // The control socket and signal handler set shutdown. Also notice
+            // an explicit host-side unmount so the daemon can exit cleanly.
+            while !shutdown.load(Ordering::SeqCst) && nfs::is_mount_active(handle.mountpoint()) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        });
 
-        // Let the accept loop start before macOS's NFS client connects.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // The mount process waits for NFS RPC replies, so keep it off the
-        // runtime threads that service those replies.
-        let mountpoint_for_command = mountpoint.clone();
-        let mount_result =
-            tokio::task::spawn_blocking(move || nfs_mount_command(port, &mountpoint_for_command))
-                .await
-                .map_err(|e| std::io::Error::other(format!("mount command task panicked: {e}")))?;
-
-        if let Err(e) = mount_result {
-            server_task.abort();
-            let _ = server_task.await;
-            return Err(e);
-        }
-
-        log::info!("NFS mount ready at {} (port {port})", mountpoint.display());
-
-        while is_mount_active(&mountpoint) {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-
-        server_task.abort();
-        let _ = server_task.await;
-        Ok(())
+            drop(handle);
+            Ok(())
+        })
     }
-}
-
-#[cfg(target_os = "macos")]
-fn nfs_mount_command(port: u16, mountpoint: &Path) -> std::io::Result<()> {
-    let options = format!(
-        "locallocks,vers=3,tcp,port={port},mountport={port},soft,timeo=100,retrans=3,acregmin=1,acregmax=5"
-    );
-    let output = std::process::Command::new("/sbin/mount_nfs")
-        .arg("-o")
-        .arg(options)
-        .arg("127.0.0.1:/")
-        .arg(mountpoint)
-        .output()
-        .map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to execute /sbin/mount_nfs: {e}"))
-        })?;
-
-    if !output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "mount_nfs failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn find_free_nfs_port(start: u16) -> std::io::Result<u16> {
-    for offset in 0..MAX_NFS_PORT_SCAN {
-        let port = start.saturating_add(offset);
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Ok(port);
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AddrNotAvailable,
-        format!(
-            "could not find a free NFS port in range {}-{}",
-            start,
-            start.saturating_add(MAX_NFS_PORT_SCAN)
-        ),
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn is_mount_active(mountpoint: &Path) -> bool {
-    let Ok(output) = std::process::Command::new("/sbin/mount").output() else {
-        return true;
-    };
-
-    if !output.status.success() {
-        return true;
-    }
-
-    let needle = mountpoint.to_string_lossy();
-    let mounts = String::from_utf8_lossy(&output.stdout);
-    mounts.lines().any(|line| line.contains(needle.as_ref()))
 }
 
 #[cfg(target_os = "linux")]
@@ -1173,153 +1011,5 @@ impl Filesystem for GhFs {
         reply: ReplyEntry,
     ) {
         reply.error(libc::EROFS);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn errno_to_nfs(err: i32) -> nfsstat3 {
-    match err {
-        libc::ENOENT => nfsstat3::NFS3ERR_NOENT,
-        libc::EACCES => nfsstat3::NFS3ERR_ACCES,
-        libc::EPERM => nfsstat3::NFS3ERR_PERM,
-        libc::ENOTDIR => nfsstat3::NFS3ERR_NOTDIR,
-        libc::EISDIR => nfsstat3::NFS3ERR_ISDIR,
-        libc::EINVAL => nfsstat3::NFS3ERR_INVAL,
-        libc::ENOSPC => nfsstat3::NFS3ERR_NOSPC,
-        libc::EROFS => nfsstat3::NFS3ERR_ROFS,
-        libc::EEXIST => nfsstat3::NFS3ERR_EXIST,
-        libc::ENAMETOOLONG => nfsstat3::NFS3ERR_NAMETOOLONG,
-        libc::ENOTEMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
-        _ => nfsstat3::NFS3ERR_IO,
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[async_trait]
-impl NFSFileSystem for GhFs {
-    fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadOnly
-    }
-
-    fn root_dir(&self) -> fileid3 {
-        ROOT_INO
-    }
-
-    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let name = OsStr::from_bytes(&filename.0);
-        self.lookup_inode(dirid, name).map_err(errno_to_nfs)
-    }
-
-    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        self.stat_inode(id)
-            .map(|attr| attr.to_nfs_attr())
-            .map_err(errno_to_nfs)
-    }
-
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn read(
-        &self,
-        id: fileid3,
-        offset: u64,
-        count: u32,
-    ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        self.read_file_range(id, offset, count)
-            .map_err(errno_to_nfs)
-    }
-
-    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn create(
-        &self,
-        _dirid: fileid3,
-        _filename: &filename3,
-        _attr: sattr3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn create_exclusive(
-        &self,
-        _dirid: fileid3,
-        _filename: &filename3,
-    ) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn mkdir(
-        &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn rename(
-        &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
-    ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn readdir(
-        &self,
-        dirid: fileid3,
-        start_after: fileid3,
-        max_entries: usize,
-    ) -> Result<ReadDirResult, nfsstat3> {
-        let entries = self.list_children(dirid).map_err(errno_to_nfs)?;
-        let start_index = if start_after == 0 {
-            0
-        } else {
-            entries
-                .iter()
-                .position(|entry| entry.ino == start_after)
-                .map(|idx| idx + 1)
-                .unwrap_or(0)
-        };
-
-        let mut out = Vec::new();
-        for entry in entries.iter().skip(start_index).take(max_entries) {
-            let attr = self
-                .stat_inode(entry.ino)
-                .map(|a| a.to_nfs_attr())
-                .map_err(errno_to_nfs)?;
-            out.push(DirEntry {
-                fileid: entry.ino,
-                name: entry.name.as_os_str().as_bytes().to_vec().into(),
-                attr,
-            });
-        }
-
-        let end = start_index + out.len() >= entries.len();
-        Ok(ReadDirResult { entries: out, end })
-    }
-
-    async fn symlink(
-        &self,
-        _dirid: fileid3,
-        _linkname: &filename3,
-        _symlink: &nfspath3,
-        _attr: &sattr3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        self.readlink_bytes(id)
-            .map(Into::into)
-            .map_err(errno_to_nfs)
     }
 }

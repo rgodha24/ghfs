@@ -222,11 +222,13 @@ impl Daemon {
         log::info!("Scheduler started");
 
         // Setup signal handler for graceful shutdown
+        #[cfg(target_os = "linux")]
         let mount_point = self.mount_point.to_string_lossy().to_string();
         let shutdown = Arc::clone(&self.shutdown);
         ctrlc::set_handler(move || {
             log::info!("Received shutdown signal");
             shutdown.store(true, Ordering::SeqCst);
+            #[cfg(target_os = "linux")]
             spawn_unmount(mount_point.clone());
         })
         .expect("failed to set signal handler");
@@ -244,12 +246,15 @@ impl Daemon {
         log::info!("Mounting filesystem backend");
 
         // This blocks until unmount
-        if let Err(e) = fs.mount(&self.mount_point) {
+        if let Err(e) = fs.mount(&self.mount_point, Arc::clone(&self.shutdown)) {
             log::error!("Mount failed: {}", e);
             return Err(DaemonError::Mount(e));
         }
 
         log::info!("Filesystem unmounted, shutting down");
+
+        // Let the Stop RPC response flush before socket teardown.
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Shutdown is triggered by unmount or signal
         // Threads will clean up via their Drop impls
