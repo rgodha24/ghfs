@@ -1,16 +1,14 @@
-pub mod cache;
-pub mod cli;
-pub mod daemon;
-pub mod fs;
-pub mod protocol;
-pub mod service;
-pub mod store;
-pub mod types;
+use ghfs::{
+    cli,
+    cli::{Client, ClientError},
+    daemon, service,
+    types::RepoKey,
+};
 
 use clap::{Parser, Subcommand};
 
-use crate::cli::{Client, ClientError};
-use crate::types::RepoKey;
+#[allow(unused_imports)]
+use ghfs::protocol::{Request, VersionResult};
 
 fn command_in_path(name: &str) -> bool {
     std::env::var_os("PATH")

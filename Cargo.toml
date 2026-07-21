@@ -8,6 +8,14 @@ repository = "https://github.com/rgodha24/ghfs"
 homepage = "https://github.com/rgodha24/ghfs"
 readme = "README.md"
 
+[lib]
+name = "ghfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghfs"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5.15"
