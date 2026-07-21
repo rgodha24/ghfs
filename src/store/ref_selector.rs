@@ -21,7 +21,7 @@
 //! `/by-ref/by-ref/...` because `by-ref` is only reserved at the *root*
 //! level as the first component.
 
-use crate::types::{Owner, Repo, RepoKey};
+use crate::types::{Owner, RepoKey};
 
 /// Reserved first path component that selects the by-ref namespace.
 pub const BY_REF_ROOT: &str = "by-ref";
