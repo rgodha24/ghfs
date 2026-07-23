@@ -492,7 +492,13 @@ impl GhFs {
                     kind: FsKind::Directory,
                     name: OsString::from(BY_REF_ROOT),
                 }];
-                for owner in self.list_cached_owners() {
+                // `by-ref` is the synthetic namespace at the root. An owner
+                // with that name remains available below `/by-ref/by-ref`.
+                for owner in self
+                    .list_cached_owners()
+                    .into_iter()
+                    .filter(|owner| owner != BY_REF_ROOT)
+                {
                     let owner_ino = self.inodes.get_or_alloc_virtual(
                         ino,
                         &owner,
