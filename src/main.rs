@@ -23,6 +23,7 @@ fn command_in_path(name: &str) -> bool {
 #[derive(Parser)]
 #[command(
     name = "ghfs",
+    version,
     about = "GitHub Filesystem - mount GitHub repos locally"
 )]
 struct Cli {
