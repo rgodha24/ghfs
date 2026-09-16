@@ -5,10 +5,12 @@
 //! promisor. Operates entirely against the [`crate::store::Store`].
 
 use crossbeam_channel::{Receiver, Sender, bounded};
+use std::sync::Arc;
 use std::sync::mpsc as oneshot;
 use std::thread::{self, JoinHandle};
 
 use crate::cache::NegativeCache;
+use crate::daemon::State;
 use crate::store::{Store, StoreError};
 use crate::types::RepoKey;
 
@@ -46,15 +48,40 @@ pub enum WorkerRequest {
 pub struct Worker {
     receiver: Receiver<WorkerRequest>,
     store: Store,
+    state: Arc<State>,
     negative_cache: NegativeCache,
 }
 
 impl Worker {
-    pub fn new(receiver: Receiver<WorkerRequest>, store: Store) -> Self {
+    pub fn new(receiver: Receiver<WorkerRequest>, store: Store, state: Arc<State>) -> Self {
         Self {
             receiver,
             store,
+            state,
             negative_cache: NegativeCache::new(),
+        }
+    }
+
+    /// Persist the HEAD commit and sync time for a repo. Failures are logged
+    /// but never surfaced: the mirror is the source of truth, the db is
+    /// bookkeeping for `ghfs status`, the scheduler, and gc.
+    fn record_sync(&self, repo: &RepoKey, commit: &str) {
+        if let Err(e) = self.state.record_sync(repo, commit) {
+            log::warn!("Failed to record sync for {repo}: {e}");
+        }
+    }
+
+    fn record_access(&self, repo: &RepoKey) {
+        if let Err(e) = self.state.touch_access(repo) {
+            log::warn!("Failed to record access for {repo}: {e}");
+        }
+    }
+
+    /// Resolve HEAD after a refresh and persist it.
+    fn record_refreshed_head(&self, repo: &RepoKey) {
+        match self.store.resolve_head(repo) {
+            Ok(oid) => self.record_sync(repo, &oid.to_string()),
+            Err(e) => log::warn!("Failed to resolve HEAD after refresh for {repo}: {e}"),
         }
     }
 
@@ -69,10 +96,17 @@ impl Worker {
                         continue;
                     }
                     let result = self.store.resolve_head(&repo).map(|oid| oid.to_string());
-                    if let Err(StoreError::Git(crate::store::GitError::CloneError(_))) = &result {
-                        if self.negative_cache.insert_if_not_exists(&repo) {
-                            // confirmed not found; error already returned
+                    match &result {
+                        Ok(commit) => {
+                            self.record_access(&repo);
+                            self.record_sync(&repo, commit);
                         }
+                        Err(StoreError::Git(crate::store::GitError::CloneError(_))) => {
+                            if self.negative_cache.insert_if_not_exists(&repo) {
+                                // confirmed not found; error already returned
+                            }
+                        }
+                        Err(_) => {}
                     }
                     let _ = reply.send(result);
                 }
@@ -81,25 +115,33 @@ impl Worker {
                     selector,
                     reply,
                 }) => {
-                    let _ = reply.send(
-                        self.store
-                            .resolve_revision(&repo, &selector)
-                            .map(|oid| oid.to_string()),
-                    );
+                    let result = self
+                        .store
+                        .resolve_revision(&repo, &selector)
+                        .map(|oid| oid.to_string());
+                    if result.is_ok() {
+                        self.record_access(&repo);
+                    }
+                    let _ = reply.send(result);
                 }
                 Ok(WorkerRequest::Refresh { repo }) => {
                     if self.negative_cache.contains(&repo) {
                         continue;
                     }
-                    if let Err(e) = self.store.refresh(&repo) {
-                        log::warn!("Background refresh failed for {repo}: {e}");
+                    match self.store.refresh(&repo) {
+                        Ok(()) => self.record_refreshed_head(&repo),
+                        Err(e) => log::warn!("Background refresh failed for {repo}: {e}"),
                     }
                 }
                 Ok(WorkerRequest::Sync { repo, reply }) => {
-                    let _ = reply.send(match self.store.refresh(&repo) {
+                    let result = match self.store.refresh(&repo) {
                         Ok(()) => self.store.resolve_head(&repo).map(|oid| oid.to_string()),
                         Err(e) => Err(e),
-                    });
+                    };
+                    if let Ok(commit) = &result {
+                        self.record_sync(&repo, commit);
+                    }
+                    let _ = reply.send(result);
                 }
                 Ok(WorkerRequest::Shutdown) => {
                     log::info!("Worker thread shutting down");
@@ -122,9 +164,9 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     /// Spawn the worker thread.
-    pub fn spawn(store: Store) -> Self {
+    pub fn spawn(store: Store, state: Arc<State>) -> Self {
         let (sender, receiver) = bounded(100);
-        let worker = Worker::new(receiver, store);
+        let worker = Worker::new(receiver, store, state);
         let thread = thread::Builder::new()
             .name("ghfs-worker".to_string())
             .spawn(move || worker.run())

@@ -201,7 +201,7 @@ impl Daemon {
         let store = Store::new(self.cache_paths.clone());
 
         // Spawn worker thread
-        let worker = Arc::new(WorkerHandle::spawn(store.clone()));
+        let worker = Arc::new(WorkerHandle::spawn(store.clone(), Arc::clone(&self.state)));
         log::info!("Worker thread started");
 
         // Spawn socket server

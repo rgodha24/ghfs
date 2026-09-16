@@ -181,6 +181,25 @@ impl State {
         Ok(())
     }
 
+    /// Record the current HEAD commit after a successful mirror sync.
+    ///
+    /// The store-backed model has no worktree generations, so this only
+    /// updates `head_commit` and `last_sync_at`.
+    pub fn record_sync(&self, key: &RepoKey, commit: &str) -> Result<(), rusqlite::Error> {
+        let owner = key.owner.as_str();
+        let repo = key.repo.as_str();
+        let now = now_unix();
+        let _ = self.get_or_create_repo_id(key)?;
+        let conn = self.conn.lock().unwrap();
+
+        conn.execute(
+            "UPDATE repos SET head_commit = ?1, last_sync_at = ?2
+             WHERE owner = ?3 AND repo = ?4",
+            params![commit, now, owner, repo],
+        )?;
+        Ok(())
+    }
+
     /// Clear sync metadata for a repository.
     pub fn clear_sync(&self, key: &RepoKey) -> Result<(), rusqlite::Error> {
         let owner = key.owner.as_str();
@@ -476,6 +495,20 @@ mod tests {
         assert!(repo.current_generation.is_none());
         assert!(repo.head_commit.is_none());
         assert!(repo.last_sync_at.is_none());
+    }
+
+    #[test]
+    fn test_record_sync_sets_head_and_sync_time() {
+        let (state, _dir) = create_test_state();
+        let key = make_repo_key("owner", "repo");
+
+        state.record_sync(&key, "abc123").unwrap();
+
+        let repo = state.get_or_create_repo(&key).unwrap();
+        assert_eq!(repo.head_commit.as_deref(), Some("abc123"));
+        assert!(repo.last_sync_at.is_some());
+        assert_eq!(repo.current_generation, None);
+        assert!(!state.delete_repo_if_never_synced(&key).unwrap());
     }
 
     #[test]
