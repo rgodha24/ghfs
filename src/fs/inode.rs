@@ -1,14 +1,16 @@
 //! Inode table for the store-backed filesystem.
 //!
 //! Inodes are fully synthesized from git object identity; there is no
-//! passthrough of an underlying worktree filesystem anymore. Two ranges:
+//! passthrough of an underlying worktree filesystem anymore. Two kinds share
+//! one monotonically increasing allocator (a u64 never wraps in practice):
 //!
-//! - Virtual range (reserved small inodes): the dynamic owner/repo/ref
-//!   discovery tree plus the reserved `/by-ref` root.
-//! - Path range (allocated from `PASSTHROUGH_INO_START` upward): one inode
-//!   per `(repo, commit_oid, repo-relative path)`. Directories carry their
-//!   git tree OID so descending is a single `tree_entry` lookup; files carry
-//!   their blob OID for hydration.
+//! - Virtual inodes: the dynamic owner/repo/ref discovery tree plus the
+//!   reserved `/by-ref` root. These are never reclaimed so discovery paths
+//!   keep stable inode numbers for the life of the mount.
+//! - Path inodes: one per `(repo, commit_oid, repo-relative path)`.
+//!   Directories carry their git tree OID so descending is a single
+//!   `tree_entry` lookup; files carry their blob OID for hydration. Reclaimed
+//!   on `forget`.
 
 use crate::store::EntryKind;
 use crate::types::{Owner, RepoKey};
@@ -19,12 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const ROOT_INO: u64 = 1;
 /// Reserved inode for the `/by-ref` parallel root.
 pub const BY_REF_INO: u64 = 2;
-/// First dynamically-allocated virtual inode.
-pub const VIRTUAL_INO_START: u64 = 3;
-/// Last virtual inode (inclusive).
-pub const VIRTUAL_INO_END: u64 = 1000;
-/// First inode allocated to real repository paths.
-pub const PASSTHROUGH_INO_START: u64 = 1001;
+/// First dynamically-allocated inode (virtual or path).
+pub const FIRST_DYNAMIC_INO: u64 = 3;
 
 /// Identity of a resolved repository path inode: `(repo, commit, path)`.
 /// Immutability of git objects makes this a stable, content-defined key.
@@ -100,8 +98,7 @@ impl InodeData {
 }
 
 pub struct InodeTable {
-    next_virtual: AtomicU64,
-    next_path: AtomicU64,
+    next_ino: AtomicU64,
     forward: DashMap<u64, InodeData>,
     /// `(parent_ino, name_utf8)` → virtual child inode (for stable discovery).
     virtual_children: DashMap<(u64, String), u64>,
@@ -115,8 +112,7 @@ impl InodeTable {
         forward.insert(ROOT_INO, InodeData::Root);
         forward.insert(BY_REF_INO, InodeData::ByRefRoot);
         Self {
-            next_virtual: AtomicU64::new(VIRTUAL_INO_START),
-            next_path: AtomicU64::new(PASSTHROUGH_INO_START),
+            next_ino: AtomicU64::new(FIRST_DYNAMIC_INO),
             forward,
             virtual_children: DashMap::new(),
             path_reverse: DashMap::new(),
@@ -128,27 +124,17 @@ impl InodeTable {
         self.forward.get(&ino).map(|r| r.clone())
     }
 
-    /// Whether `ino` is within the reserved virtual range.
-    pub fn is_virtual_ino(ino: u64) -> bool {
-        ino < PASSTHROUGH_INO_START
-    }
-
     /// Get or create a virtual child inode of `parent` named `name`, storing
-    /// `data`. Returns the inode number. Allocation from the virtual range.
-    pub fn get_or_alloc_virtual(
-        &self,
-        parent: u64,
-        name: &str,
-        data: InodeData,
-    ) -> Result<u64, i32> {
+    /// `data`. Returns the inode number.
+    pub fn get_or_alloc_virtual(&self, parent: u64, name: &str, data: InodeData) -> u64 {
         if let Some(ino) = self.virtual_children.get(&(parent, name.to_string())) {
-            return Ok(*ino);
+            return *ino;
         }
-        let ino = self.alloc_virtual()?;
+        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
         self.forward.insert(ino, data);
         self.virtual_children
             .insert((parent, name.to_string()), ino);
-        Ok(ino)
+        ino
     }
 
     /// Get or create a path inode for `(repo, commit, path)`.
@@ -162,7 +148,7 @@ impl InodeTable {
         if let Some(ino) = self.path_reverse.get(&key) {
             return *ino;
         }
-        let ino = self.next_path.fetch_add(1, Ordering::Relaxed);
+        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
         self.forward.insert(
             ino,
             InodeData::Path {
@@ -193,22 +179,38 @@ impl InodeTable {
             }
         }
     }
-
-    fn alloc_virtual(&self) -> Result<u64, i32> {
-        self.next_virtual
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if cur >= VIRTUAL_INO_END {
-                    None
-                } else {
-                    Some(cur + 1)
-                }
-            })
-            .map_err(|_| libc::ENOSPC)
-    }
 }
 
 impl Default for InodeTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_inodes_are_not_capped() {
+        // Listing `/by-ref/<owner>/<repo>` allocates one virtual inode per
+        // branch and tag; big repos have thousands. Regression for the old
+        // fixed 998-slot range that surfaced as ENOSPC on every later lookup.
+        let table = InodeTable::new();
+        let owner: Owner = "o".parse().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..5000 {
+            let ino = table.get_or_alloc_virtual(
+                ROOT_INO,
+                &format!("ref-{i}"),
+                InodeData::Owner(owner.clone()),
+            );
+            assert!(seen.insert(ino), "duplicate inode {ino}");
+        }
+        // Same (parent, name) resolves to the same inode.
+        assert_eq!(
+            table.get_or_alloc_virtual(ROOT_INO, "ref-0", InodeData::Owner(owner.clone())),
+            *seen.iter().min().unwrap()
+        );
     }
 }

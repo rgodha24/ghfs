@@ -37,10 +37,7 @@ mod inode;
 #[cfg(target_os = "macos")]
 mod nfs;
 
-pub use inode::{
-    BY_REF_INO, InodeData, InodeTable, PASSTHROUGH_INO_START, PathKey, ROOT_INO, VIRTUAL_INO_END,
-    VIRTUAL_INO_START,
-};
+pub use inode::{BY_REF_INO, FIRST_DYNAMIC_INO, InodeData, InodeTable, PathKey, ROOT_INO};
 
 /// TTL for virtual discovery nodes (root, owners, by-ref roots, ref-repo
 /// directory listings).
@@ -328,7 +325,7 @@ impl GhFs {
                 parent,
                 name_str,
                 InodeData::Owner(name_str.parse::<Owner>().unwrap()),
-            )?);
+            ));
         }
 
         if parent == BY_REF_INO {
@@ -339,7 +336,7 @@ impl GhFs {
                 parent,
                 name_str,
                 InodeData::RefOwner(name_str.parse::<Owner>().unwrap()),
-            )?);
+            ));
         }
 
         let parent_data = self.inodes.get(parent).ok_or(libc::ENOENT)?;
@@ -365,7 +362,7 @@ impl GhFs {
                         commit,
                         root_tree: root_tree.to_string(),
                     },
-                )?)
+                ))
             }
             InodeData::RefOwner(owner) => {
                 if !Self::is_valid_repo(name_str) {
@@ -375,7 +372,7 @@ impl GhFs {
                 let key = RepoKey::new(owner, repo);
                 Ok(self
                     .inodes
-                    .get_or_alloc_virtual(parent, name_str, InodeData::RefRepo(key))?)
+                    .get_or_alloc_virtual(parent, name_str, InodeData::RefRepo(key)))
             }
             InodeData::RefRepo(key) => {
                 // Child is an encoded ref selector.
@@ -394,7 +391,7 @@ impl GhFs {
                         commit,
                         root_tree: root_tree.to_string(),
                     },
-                )?)
+                ))
             }
             // ---- commit-pinned path descent ----
             InodeData::Repo {
@@ -503,7 +500,7 @@ impl GhFs {
                         ino,
                         &owner,
                         InodeData::Owner(owner.parse::<Owner>().unwrap()),
-                    )?;
+                    );
                     out.push(DirEntryInfo {
                         ino: owner_ino,
                         kind: FsKind::Directory,
@@ -519,7 +516,7 @@ impl GhFs {
                         ino,
                         &owner,
                         InodeData::RefOwner(owner.parse::<Owner>().unwrap()),
-                    )?;
+                    );
                     out.push(DirEntryInfo {
                         ino: owner_ino,
                         kind: FsKind::Directory,
@@ -538,8 +535,7 @@ impl GhFs {
                     // scans the mirror dir, so this holds).
                     let ino = self
                         .inodes
-                        .get_or_alloc_virtual(ino, &repo, InodeData::RefRepo(key))
-                        .map_err(|_| libc::EIO)?; // shouldn't run out of vnodes for small lists
+                        .get_or_alloc_virtual(ino, &repo, InodeData::RefRepo(key));
                     out.push(DirEntryInfo {
                         ino,
                         kind: FsKind::Directory,
@@ -552,9 +548,9 @@ impl GhFs {
                 let mut out = Vec::new();
                 for repo in self.list_cached_repos(owner.as_str()) {
                     let key = RepoKey::new(owner.clone(), repo.parse::<Repo>().unwrap());
-                    let ino =
-                        self.inodes
-                            .get_or_alloc_virtual(ino, &repo, InodeData::RefRepo(key))?;
+                    let ino = self
+                        .inodes
+                        .get_or_alloc_virtual(ino, &repo, InodeData::RefRepo(key));
                     out.push(DirEntryInfo {
                         ino,
                         kind: FsKind::Directory,
@@ -603,7 +599,7 @@ impl GhFs {
                             commit,
                             root_tree,
                         },
-                    )?;
+                    );
                     out.push(DirEntryInfo {
                         ino,
                         kind: FsKind::Directory,
@@ -751,9 +747,6 @@ impl GhFs {
 
     #[cfg(target_os = "macos")]
     fn read_file_range(&self, ino: u64, offset: u64, size: u32) -> Result<(Vec<u8>, bool), i32> {
-        if InodeTable::is_virtual_ino(ino) {
-            return Err(libc::EISDIR);
-        }
         let mut file = self.open_blob(ino)?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| io_errno(e, libc::EIO))?;
@@ -930,10 +923,6 @@ impl Filesystem for GhFs {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         if flags & libc::O_ACCMODE != libc::O_RDONLY {
             reply.error(libc::EROFS);
-            return;
-        }
-        if InodeTable::is_virtual_ino(ino) {
-            reply.error(libc::EISDIR);
             return;
         }
         match self.open_blob(ino) {
