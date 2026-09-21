@@ -528,14 +528,36 @@ impl GhFs {
             InodeData::Owner(owner) => {
                 let mut out = Vec::new();
                 for repo in self.list_cached_repos(owner.as_str()) {
-                    let name = repo.clone();
-                    let key = RepoKey::new(owner.clone(), name.parse::<Repo>().unwrap());
-                    // Don't clone on a mere listing of cached repos; only show
-                    // repos whose mirror already exists (list_cached_repos
-                    // scans the mirror dir, so this holds).
-                    let ino = self
-                        .inodes
-                        .get_or_alloc_virtual(ino, &repo, InodeData::RefRepo(key));
+                    let key = RepoKey::new(owner.clone(), repo.parse::<Repo>().unwrap());
+                    // Register the same `Repo` node that a direct lookup of
+                    // `/<owner>/<repo>` would, so a listing seen first doesn't
+                    // pin the name to a by-ref-style node. list_cached_repos
+                    // scans the mirror dir, so resolving HEAD here is local
+                    // and never clones.
+                    let commit = match self.store.resolve_head(&key) {
+                        Ok(c) => c.to_string(),
+                        Err(e) => {
+                            log::warn!("resolve {key} HEAD for listing: {e}");
+                            continue;
+                        }
+                    };
+                    let root_tree = match self.store.root_tree(&key, parse_oid(&commit)?) {
+                        Ok(t) => t.to_string(),
+                        Err(e) => {
+                            log::warn!("root_tree {key} {commit}: {e}");
+                            continue;
+                        }
+                    };
+                    let ino = self.inodes.get_or_alloc_virtual(
+                        ino,
+                        &repo,
+                        InodeData::Repo {
+                            key,
+                            selector: None,
+                            commit,
+                            root_tree,
+                        },
+                    );
                     out.push(DirEntryInfo {
                         ino,
                         kind: FsKind::Directory,
