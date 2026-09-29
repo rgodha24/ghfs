@@ -103,11 +103,15 @@ async fn run() -> Result<(), DaemonError> {
     log::info!("Mount point: {}", mount_point.display());
     log::info!("Cache: {}", paths.root().display());
 
-    let removed = paths.remove_legacy();
-    if !removed.is_empty() {
-        log::info!("Removed legacy cache entries: {}", removed.join(", "));
-    }
     paths.create_dirs()?;
+    // Old mirrors can be many GB; deleting them must not delay the mount.
+    let legacy = paths.clone();
+    tokio::task::spawn_blocking(move || {
+        let removed = legacy.remove_legacy();
+        if !removed.is_empty() {
+            log::info!("Removed legacy cache entries: {}", removed.join(", "));
+        }
+    });
 
     let repos = Repos::new(paths, GitCli::new());
     let vfs = Vfs::new(repos.clone());

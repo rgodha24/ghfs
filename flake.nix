@@ -35,7 +35,7 @@
         in {
           packages.default = pkgs.rustPlatform.buildRustPackage {
             pname = "ghfs";
-            version = "0.1.0";
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 
             src = ./.;
 
