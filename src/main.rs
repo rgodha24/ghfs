@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 #[allow(unused_imports)]
 use ghfs::protocol::{Request, VersionResult};
 
+#[cfg(target_os = "linux")]
 fn command_in_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
@@ -51,7 +52,7 @@ enum Commands {
         repo: String,
     },
 
-    /// Garbage collect cache metadata and stale state
+    /// Repack cached repos and drop old cached file contents
     Gc,
 
     /// Check dependencies
@@ -166,9 +167,12 @@ fn cmd_gc() -> Result<(), Box<dyn std::error::Error>> {
     let result = client.gc()?;
 
     println!("Garbage collection complete");
-    println!("  Repositories scanned: {}", result.repos_scanned);
-    println!("  Repositories removed: {}", result.repos_removed);
-    println!("  Sync state reset:     {}", result.sync_resets);
+    println!("  Repositories repacked: {}", result.repos_repacked);
+    println!("  Cached blobs removed:  {}", result.blobs_removed);
+    println!(
+        "  Space freed:           {:.1} MiB",
+        result.bytes_freed as f64 / (1024.0 * 1024.0)
+    );
 
     Ok(())
 }
@@ -233,15 +237,11 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Check cache directory
-    let cache_dir = dirs::cache_dir().map(|p| p.join("ghfs"));
-    let cache_ok = cache_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let cache_dir = ghfs::paths::CachePaths::from_env().root();
     println!(
         "[{}] Cache dir: {}",
-        if cache_ok { "OK" } else { "INFO" },
-        cache_dir
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or("unknown".into())
+        if cache_dir.exists() { "OK" } else { "INFO" },
+        cache_dir.display()
     );
 
     // Check if daemon is running

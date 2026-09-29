@@ -1,268 +1,161 @@
-//! Unix socket server for handling JSON-RPC requests from the CLI.
+//! JSON-RPC over a Unix socket for the CLI (`ghfs status`, `ghfs sync`, ...).
 
-use std::io::BufReader;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::cache::CachePaths;
-use crate::daemon::gc;
-use crate::daemon::state::State;
-use crate::daemon::worker::WorkerHandle;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+
 use crate::protocol::{
-    GcResult, ListResult, RepoInfo, Request, Response, RpcError, RpcErrorResponse, RpcResponse,
-    StatusResult, SyncResult, VersionResult, read_request, write_message,
+    ListResult, RepoInfo, Request, Response, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    StatusResult, SyncResult, VersionResult,
 };
+use crate::repos::{RepoError, Repos};
 use crate::types::RepoKey;
 
-/// Get the socket path for the daemon.
-///
-/// Uses `$XDG_RUNTIME_DIR/ghfs.sock` on Linux.
-/// Falls back to `/tmp/ghfs-$UID.sock`.
+/// `$GHFS_SOCKET`, else `$XDG_RUNTIME_DIR/ghfs.sock`, else `/tmp/ghfs-$UID.sock`.
 pub fn socket_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("GHFS_SOCKET") {
+        return PathBuf::from(path);
+    }
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime_dir).join("ghfs.sock");
     }
-
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/ghfs-{}.sock", uid))
+    PathBuf::from(format!("/tmp/ghfs-{uid}.sock"))
 }
 
-/// Context shared by request handlers.
 pub struct Context {
-    pub state: Arc<State>,
-    pub worker: Arc<WorkerHandle>,
-    pub cache_paths: CachePaths,
-    pub start_time: Instant,
+    pub repos: Arc<Repos>,
+    pub started: Instant,
     pub mount_point: String,
-    pub shutdown: Arc<AtomicBool>,
+    pub shutdown: watch::Sender<bool>,
 }
 
-/// Handle a single JSON-RPC request.
-fn handle_request(ctx: &Context, request: Request) -> Result<Response, RpcError> {
-    match request {
-        Request::Status => {
-            let repos = ctx
-                .state
-                .list_repos()
-                .map_err(|e| RpcError::internal(e.to_string()))?;
+pub fn bind() -> std::io::Result<UnixListener> {
+    let path = socket_path();
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    let listener = UnixListener::bind(&path)?;
+    log::info!("Socket listening on {}", path.display());
+    Ok(listener)
+}
 
-            Ok(Response::Status(StatusResult {
-                running: true,
-                mount_point: ctx.mount_point.clone(),
-                repo_count: repos.len(),
-                uptime_secs: ctx.start_time.elapsed().as_secs(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                pid: std::process::id(),
-                pending_syncs: vec![], // TODO: track pending syncs in worker
-            }))
+pub async fn serve(listener: UnixListener, ctx: Arc<Context>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client(stream, ctx).await {
+                        log::debug!("socket client error: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                log::warn!("socket accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
+    }
+}
 
+async fn client(stream: UnixStream, ctx: Arc<Context>) -> std::io::Result<()> {
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    while let Some(line) = lines.next_line().await? {
+        let request: RpcRequest = serde_json::from_str(&line)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let id = request.id.clone();
+        let json = match handle(&ctx, request.request).await {
+            Ok(result) => serde_json::to_string(&RpcResponse::new(result, id)),
+            Err(error) => serde_json::to_string(&RpcErrorResponse::new(error, id)),
+        }
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        wr.write_all(json.as_bytes()).await?;
+        wr.write_all(b"\n").await?;
+        wr.flush().await?;
+    }
+    Ok(())
+}
+
+async fn handle(ctx: &Context, request: Request) -> Result<Response, RpcError> {
+    match request {
+        Request::Status => Ok(Response::Status(StatusResult {
+            running: true,
+            mount_point: ctx.mount_point.clone(),
+            repo_count: ctx.repos.paths().cached_repos().len(),
+            uptime_secs: ctx.started.elapsed().as_secs(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+            pending_syncs: ctx.repos.activity(),
+        })),
         Request::Sync { repo } => {
             let key: RepoKey = repo
                 .parse()
-                .map_err(|e| RpcError::invalid_params(format!("invalid repo: {}", e)))?;
-
-            let commit = ctx
-                .worker
-                .sync(key)
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-
-            Ok(Response::Sync(SyncResult { commit }))
-        }
-
-        Request::Gc => {
-            let stats = gc::run_gc(&ctx.state, &ctx.cache_paths);
-
-            Ok(Response::Gc(GcResult {
-                repos_scanned: stats.repos_scanned,
-                repos_removed: stats.repos_removed,
-                sync_resets: stats.sync_resets,
+                .map_err(|e| RpcError::invalid_params(format!("invalid repo: {e}")))?;
+            let handle = ctx.repos.get(&key);
+            let refs = handle.refresh_head().await.map_err(rpc_error)?;
+            let head = refs
+                .head
+                .ok_or_else(|| RpcError::not_found(format!("{key} has no HEAD")))?;
+            handle.ensure_commit(head).await.map_err(rpc_error)?;
+            Ok(Response::Sync(SyncResult {
+                commit: head.to_string(),
             }))
         }
-
+        Request::Gc => Ok(Response::Gc(super::maintenance::gc(&ctx.repos).await)),
         Request::List => {
-            let repos = ctx
-                .state
-                .list_repos_with_stats()
-                .map_err(|e| RpcError::internal(e.to_string()))?;
-
-            let infos: Vec<RepoInfo> = repos
-                .into_iter()
-                .map(|r| RepoInfo {
-                    owner: r.owner,
-                    repo: r.repo,
-                    commit: r.head_commit,
-                    last_sync: r.last_sync_at.map(format_timestamp),
-                    last_access: r.last_access_at.map(format_timestamp),
-                    total_size_bytes: r.total_size_bytes,
-                })
-                .collect();
-
-            Ok(Response::List(ListResult { repos: infos }))
+            let mut repos = Vec::new();
+            for key in ctx.repos.paths().cached_repos() {
+                let handle = ctx.repos.get(&key);
+                let dir = handle.dir().to_path_buf();
+                let commit = handle.cached_head_commit().map(|c| c.to_string());
+                let size = tokio::task::spawn_blocking(move || dir_size(&dir))
+                    .await
+                    .unwrap_or(0);
+                repos.push(RepoInfo {
+                    owner: key.owner.to_string(),
+                    repo: key.repo.to_string(),
+                    commit,
+                    last_sync: None,
+                    last_access: None,
+                    total_size_bytes: size,
+                });
+            }
+            Ok(Response::List(ListResult { repos }))
         }
-
         Request::Version => Ok(Response::Version(VersionResult {
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
         })),
-
         Request::Stop => {
-            ctx.shutdown.store(true, Ordering::SeqCst);
-            // FUSE blocks in fuser, so Linux still needs a host-side unmount.
-            // The macOS NFS handle observes shutdown and unmounts via Drop.
-            #[cfg(target_os = "linux")]
-            super::spawn_unmount(ctx.mount_point.clone());
+            let _ = ctx.shutdown.send(true);
             Ok(Response::Ok(()))
         }
     }
 }
 
-/// Format a Unix timestamp as a human-readable relative time.
-fn format_timestamp(ts: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
-    let diff = now - ts;
-    if diff < 0 {
-        return format!("in {}s", -diff);
-    }
-    if diff < 60 {
-        format!("{}s ago", diff)
-    } else if diff < 3600 {
-        format!("{}m ago", diff / 60)
-    } else if diff < 86400 {
-        format!("{}h ago", diff / 3600)
-    } else {
-        format!("{}d ago", diff / 86400)
+fn rpc_error(e: RepoError) -> RpcError {
+    match e {
+        RepoError::NotFound(_) => RpcError::not_found(e.to_string()),
+        RepoError::Failed(_) => RpcError::internal(e.to_string()),
     }
 }
 
-/// Handle a connected client, reading requests and writing responses.
-fn handle_client(ctx: &Context, stream: UnixStream) {
-    let mut reader = BufReader::new(&stream);
-    let mut writer = &stream;
-
-    loop {
-        let rpc_req = match read_request(&mut reader) {
-            Ok(Some(req)) => req,
-            Ok(None) => break, // Client disconnected
-            Err(e) => {
-                log::warn!("Failed to read request: {}", e);
-                break;
-            }
-        };
-
-        let id = rpc_req.id.clone();
-
-        match handle_request(ctx, rpc_req.request) {
-            Ok(result) => {
-                let response = RpcResponse::new(result, id);
-                if let Err(e) = write_message(&mut writer, &response) {
-                    log::warn!("Failed to write response: {}", e);
-                    break;
-                }
-            }
-            Err(error) => {
-                let response = RpcErrorResponse::new(error, id);
-                if let Err(e) = write_message(&mut writer, &response) {
-                    log::warn!("Failed to write error response: {}", e);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Handle for managing the socket server thread.
-pub struct SocketServerHandle {
-    thread: Option<JoinHandle<()>>,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl SocketServerHandle {
-    /// Spawn the socket server thread.
-    pub fn spawn(
-        state: Arc<State>,
-        worker: Arc<WorkerHandle>,
-        cache_paths: CachePaths,
-        mount_point: String,
-        shutdown: Arc<AtomicBool>,
-    ) -> std::io::Result<Self> {
-        let path = socket_path();
-
-        // Remove stale socket file
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-
-        let listener = UnixListener::bind(&path)?;
-        log::info!("Socket server listening on {}", path.display());
-
-        let ctx = Arc::new(Context {
-            state,
-            worker,
-            cache_paths,
-            start_time: Instant::now(),
-            mount_point,
-            shutdown: Arc::clone(&shutdown),
-        });
-
-        let shutdown_clone = shutdown.clone();
-        let thread = thread::Builder::new()
-            .name("ghfs-socket".to_string())
-            .spawn(move || {
-                for stream in listener.incoming() {
-                    if shutdown_clone.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    match stream {
-                        Ok(stream) => {
-                            let ctx = Arc::clone(&ctx);
-                            thread::spawn(move || handle_client(&ctx, stream));
-                        }
-                        Err(e) => {
-                            if shutdown_clone.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            log::warn!("Failed to accept connection: {}", e);
-                        }
-                    }
-                }
-
-                // Cleanup socket file
-                let _ = std::fs::remove_file(socket_path());
-                log::info!("Socket server stopped");
-            })
-            .expect("failed to spawn socket thread");
-
-        Ok(Self {
-            thread: Some(thread),
-            shutdown,
+pub fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => 0,
         })
-    }
-
-    /// Signal shutdown and wait for thread to exit.
-    pub fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-
-        // Connect to the socket to unblock accept()
-        let _ = UnixStream::connect(socket_path());
-
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for SocketServerHandle {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
+        .sum()
 }

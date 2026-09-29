@@ -45,15 +45,8 @@
 
             buildInputs = fuseDeps;
 
-            # Skip tests that require network
-            checkFlags = [
-              "--skip=clone_bare_shallow"
-              "--skip=resolve_default_branch"
-              "--skip=create_worktree"
-              "--skip=fetch_shallow"
-              "--skip=ensure_current"
-              "--skip=concurrent"
-            ];
+            # Integration tests drive real git against local file:// remotes.
+            nativeCheckInputs = [pkgs.git];
 
             meta = with pkgs.lib; {
               description = "Mount GitHub repositories as a local filesystem";

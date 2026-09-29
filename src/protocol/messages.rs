@@ -10,7 +10,7 @@ pub enum Request {
     /// Force sync a repo
     Sync { repo: String },
 
-    /// Run cache metadata garbage collection
+    /// Repack repos and drop old materialized blobs
     Gc,
 
     /// List all known repos
@@ -45,9 +45,9 @@ pub struct SyncResult {
 /// GC response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcResult {
-    pub repos_scanned: u64,
-    pub repos_removed: u64,
-    pub sync_resets: u64,
+    pub repos_repacked: u64,
+    pub blobs_removed: u64,
+    pub bytes_freed: u64,
 }
 
 /// Single repo info for list

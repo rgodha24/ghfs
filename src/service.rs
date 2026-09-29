@@ -214,10 +214,10 @@ pub fn status() -> Result<(), ServiceError> {
         println!("Managed: Nix");
     }
 
-    if let ServiceBackend::Systemd = install.backend {
-        if let Ok(enabled) = systemd_is_enabled() {
-            println!("Enabled: {}", if enabled { "yes" } else { "no" });
-        }
+    if let ServiceBackend::Systemd = install.backend
+        && let Ok(enabled) = systemd_is_enabled()
+    {
+        println!("Enabled: {}", if enabled { "yes" } else { "no" });
     }
 
     if let Some(version) = daemon {
@@ -644,10 +644,10 @@ fn parse_launchctl_pid(output: &str) -> Option<u32> {
         }
 
         let digits: String = line.chars().filter(|c| c.is_ascii_digit()).collect();
-        if let Ok(pid) = digits.parse::<u32>() {
-            if pid > 0 {
-                return Some(pid);
-            }
+        if let Ok(pid) = digits.parse::<u32>()
+            && pid > 0
+        {
+            return Some(pid);
         }
     }
     None
@@ -763,6 +763,7 @@ fn escape_systemd_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[cfg(target_os = "linux")]
 fn path_has_executable(path_env: &str, name: &str) -> bool {
     std::env::split_paths(path_env)
         .map(|dir| dir.join(name))
@@ -816,11 +817,11 @@ fn find_open_file_pids(target_path: &str) -> Vec<u32> {
         };
 
         for fd_entry in fds.flatten() {
-            if let Ok(link_target) = fs::read_link(fd_entry.path()) {
-                if link_target.to_string_lossy().starts_with(target_path) {
-                    pids.push(pid);
-                    break;
-                }
+            if let Ok(link_target) = fs::read_link(fd_entry.path())
+                && link_target.to_string_lossy().starts_with(target_path)
+            {
+                pids.push(pid);
+                break;
             }
         }
     }

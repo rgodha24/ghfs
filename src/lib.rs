@@ -1,13 +1,15 @@
-//! GHFS library target, used by integration tests in `tests/`.
-//!
-//! The binary at `src/main.rs` re-exports these modules via `pub use` so the
-//! daemon and CLI share one implementation.
+//! GHFS library target, used by the binary and by integration tests.
 
-pub mod cache;
 pub mod cli;
 pub mod daemon;
-pub mod fs;
+#[cfg(target_os = "linux")]
+pub mod fuse;
+pub mod git;
+pub mod nfs;
+pub mod paths;
 pub mod protocol;
+pub mod repos;
 pub mod service;
-pub mod store;
+pub mod singleflight;
 pub mod types;
+pub mod vfs;

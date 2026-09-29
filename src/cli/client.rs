@@ -1,23 +1,12 @@
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 
 use crate::protocol::{
     GcResult, ListResult, Request, Response, RpcError, RpcRequest, StatusResult, SyncResult,
     VersionResult, read_response, write_message,
 };
 
-/// Get the socket path
-/// Uses $XDG_RUNTIME_DIR/ghfs.sock on Linux
-/// Falls back to /tmp/ghfs-$UID.sock
-pub fn socket_path() -> PathBuf {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("ghfs.sock");
-    }
-
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/ghfs-{}.sock", uid))
-}
+pub use crate::daemon::socket_path;
 
 /// Client for communicating with the daemon
 pub struct Client {

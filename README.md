@@ -96,7 +96,8 @@ Cache maintenance:
 ghfs gc
 ```
 
-`ghfs gc` reconciles daemon state with cache contents and clears stale metadata.
+`ghfs gc` repacks cached repos and drops cached file contents unused for a week (they're
+rebuilt from the local git objects on demand, without the network).
 
 `ghfs service install` is idempotent. Running it again rewrites service config with the current
 binary path and restarts the daemon.

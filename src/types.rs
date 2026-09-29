@@ -129,6 +129,15 @@ impl RepoKey {
     pub fn new(owner: Owner, repo: Repo) -> Self {
         Self { owner, repo }
     }
+
+    /// Lowercased key. GitHub names are case-insensitive, and so is the
+    /// default macOS filesystem, so per-repo state is keyed by this form.
+    pub fn normalized(&self) -> Self {
+        Self {
+            owner: Owner(self.owner.0.to_ascii_lowercase()),
+            repo: Repo(self.repo.0.to_ascii_lowercase()),
+        }
+    }
 }
 
 impl FromStr for RepoKey {
@@ -151,28 +160,6 @@ impl FromStr for RepoKey {
 impl fmt::Display for RepoKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.owner, self.repo)
-    }
-}
-
-/// Identifies a cache generation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GenerationId(pub u64);
-
-impl GenerationId {
-    /// Creates a new GenerationId
-    pub fn new(id: u64) -> Self {
-        Self(id)
-    }
-
-    /// Returns the inner u64 value
-    pub fn as_u64(&self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for GenerationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
