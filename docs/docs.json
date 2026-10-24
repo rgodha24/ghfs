@@ -1,0 +1,16 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "ghfs",
+  "colors": { "primary": "#16A34A", "light": "#4ADE80", "dark": "#15803D" },
+  "navigation": {
+    "groups": [
+      { "group": "Get started", "pages": ["index", "install", "usage"] },
+      { "group": "Reference", "pages": ["cli", "configuration", "nix", "how-it-works"] }
+    ]
+  },
+  "navbar": {
+    "primary": { "type": "github", "href": "https://github.com/rgodha24/ghfs" }
+  },
+  "footer": { "socials": { "github": "https://github.com/rgodha24/ghfs" } }
+}

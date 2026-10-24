@@ -1,0 +1,24 @@
+---
+title: Configuration
+description: Environment variables read by the daemon.
+---
+
+| Variable | Default |
+| --- | --- |
+| `GHFS_MOUNT_POINT` | `/mnt/github` (Linux), `/tmp/ghfs` (macOS) |
+| `GHFS_CACHE_DIR` | `~/.cache/ghfs` (Linux), `~/Library/Caches/ghfs` (macOS) |
+| `GHFS_SOCKET` | `$XDG_RUNTIME_DIR/ghfs.sock`, else `/tmp/ghfs-$UID.sock` |
+| `GHFS_GIT_BASE_URL` | `https://github.com` |
+
+Set `GHFS_SOCKET` for CLI commands too, so they can find a daemon started with a custom socket.
+
+## A scratch daemon
+
+To try a mount without touching the installed service:
+
+```bash
+GHFS_MOUNT_POINT=/tmp/ghfs-e2e/mnt \
+GHFS_CACHE_DIR=/tmp/ghfs-e2e/cache \
+GHFS_SOCKET=/tmp/ghfs-e2e/ghfs.sock \
+ghfs daemon
+```

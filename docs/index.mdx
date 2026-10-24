@@ -1,0 +1,29 @@
+---
+title: ghfs
+description: Mount any public GitHub repo as a read-only local filesystem.
+---
+
+Coding agents are really good at reading example code and library source. ghfs puts every public GitHub repo on disk, so `cat`, `rg`, and your agent can read them with no `git clone` step.
+
+```bash
+cat /mnt/github/tokio-rs/tokio/README.md
+rg "fn spawn" /mnt/github/tokio-rs/tokio/tokio/src
+ls /mnt/github/by-ref/rust-lang/rust/1.80.0
+```
+
+Files are fetched lazily the first time you touch them and cached after that.
+
+## Quickstart
+
+```bash
+cargo install ghfs --locked
+ghfs service install
+ls /mnt/github/rgodha24/ghfs
+```
+
+On macOS the mount is at `/tmp/ghfs` instead of `/mnt/github`.
+
+<CardGroup cols={2}>
+  <Card title="Install" icon="download" href="/install">Cargo, Homebrew, Nix, or the shell installer.</Card>
+  <Card title="Usage" icon="folder-tree" href="/usage">Path layout, branches, tags, and commits.</Card>
+</CardGroup>

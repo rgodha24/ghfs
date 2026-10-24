@@ -1,0 +1,25 @@
+---
+title: CLI
+description: Every ghfs command.
+---
+
+| Command | Does |
+| --- | --- |
+| `ghfs status` | Daemon status, cached repos, pending syncs, open files |
+| `ghfs sync <owner/repo>` | Fetch the latest default-branch commit now |
+| `ghfs gc` | Repack cached repos, drop file contents unused for a week |
+| `ghfs doctor` | Check dependencies |
+| `ghfs daemon` | Run the daemon in the foreground (for service managers) |
+
+## `ghfs service`
+
+| Command | Does |
+| --- | --- |
+| `install [--no-start]` | Install the user service and start it |
+| `uninstall` | Stop and remove the service |
+| `start` / `stop [--force]` | Start or stop it. `--force` kills processes holding files open under the mount |
+| `restart` | Restart (picks up a new binary) |
+| `status` | Service manager status |
+| `logs` | Tail daemon logs |
+
+`ghfs daemon` doesn't daemonize itself. Use `ghfs service` or your own systemd/launchd unit.
