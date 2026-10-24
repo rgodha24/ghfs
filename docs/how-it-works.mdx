@@ -1,0 +1,12 @@
+---
+title: How it works
+description: Fetching, caching, and mounting.
+---
+
+- **Mounting.** Linux uses FUSE. macOS uses a small NFSv3 server on localhost, mounted with `mount_nfs`. The NFS server only answers requests from your uid (or root).
+- **HEAD.** Resolved with `git ls-remote` and cached in memory and on disk. Stale values are served right away and refreshed in the background.
+- **Commits.** Fetched shallow and without blobs (`--depth=1 --filter=blob:none`), so opening a huge repo is cheap.
+- **Files.** Blobs are fetched per directory in one `git fetch --stdin` batch. Listing a directory prefetches its subtree in the background.
+- **Dedup.** Concurrent requests for the same commit or directory share one fetch.
+- **Cache.** File contents live in a content-addressed cache, written once per blob. `ghfs gc` drops contents unused for a week; they're rebuilt from local git objects without the network.
+- **Async.** Everything runs on one tokio runtime, and each filesystem request is its own task, so a slow fetch never blocks other reads.

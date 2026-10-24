@@ -1,0 +1,54 @@
+---
+title: Install
+description: Get the binary, then run it as a background service.
+---
+
+## Get the binary
+
+<CodeGroup>
+```bash Cargo
+cargo install ghfs --locked
+```
+```bash cargo-binstall
+cargo binstall ghfs
+```
+```bash Homebrew
+brew tap rgodha24/tap
+brew install ghfs
+```
+```bash Shell
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rgodha24/ghfs/releases/latest/download/ghfs-installer.sh | sh
+```
+```bash Nix
+nix run github:rgodha24/ghfs
+```
+</CodeGroup>
+
+On Nix you probably want the [Home-Manager or NixOS module](/nix) instead.
+
+## Start the service
+
+```bash
+ghfs service install
+ghfs status
+```
+
+This registers a user service (systemd on Linux, launchd on macOS) and starts it. Running it again is safe: it rewrites the service file with the current binary path and restarts the daemon.
+
+## Requirements
+
+- `git` on your `PATH`.
+- **Linux:** `/dev/fuse` and a `fusermount3` (or `fusermount`) helper.
+- **macOS:** nothing extra. ghfs runs its own NFS server on localhost and mounts it with the system `mount_nfs`.
+
+Run `ghfs doctor` to check.
+
+## Updating
+
+After installing a new binary:
+
+```bash
+ghfs service restart
+```
+
+If the binary moved, run `ghfs service install` instead.

@@ -1,0 +1,40 @@
+---
+title: Usage
+description: How paths map to repos and refs.
+---
+
+The mount root is `/mnt/github` on Linux and `/tmp/ghfs` on macOS.
+
+| Path | What you get |
+| --- | --- |
+| `/<owner>/<repo>` | The repo's default branch |
+| `/by-ref/<owner>/<repo>/<ref>` | A branch, tag, or full commit id |
+
+```bash
+ls /mnt/github/facebook/react
+cat /mnt/github/by-ref/facebook/react/v18.2.0/package.json
+ls /mnt/github/by-ref/facebook/react/main/packages
+```
+
+Everything is read-only.
+
+## Freshness
+
+The default branch's HEAD is cached. Stale values are served immediately and refreshed in the background, so only your very first visit to a repo waits on the network. To pull the latest commit right now:
+
+```bash
+ghfs sync facebook/react
+```
+
+## Speed
+
+The first read of a directory fetches all of its files in one batch, and listing a directory prefetches its subtree in the background. After that, reads come from the local cache and don't touch the network.
+
+## Using it with agents
+
+Point your agent at the mount and tell it to read library source from there, e.g. in `AGENTS.md`:
+
+```md
+Read source for any public GitHub repo at /mnt/github/<owner>/<repo>.
+Use it to check API signatures and find example code.
+```

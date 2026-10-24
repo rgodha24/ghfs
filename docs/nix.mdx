@@ -1,0 +1,44 @@
+---
+title: Nix
+description: Flake outputs and service modules.
+---
+
+The flake exports:
+
+- `packages.<system>.default`: the `ghfs` package
+- `homeManagerModules.default`: per-user service (systemd on Linux, launchd on macOS)
+- `nixosModules.default`: system-level daemon on Linux
+- `devShells.<system>.default`: dev shell
+
+Both modules default `services.ghfs.package` to this flake's package.
+
+## Home-Manager
+
+```nix
+{
+  inputs.ghfs.url = "github:rgodha24/ghfs";
+  # ...
+  home-manager.sharedModules = [ inputs.ghfs.homeManagerModules.default ];
+  home-manager.users.myuser.services.ghfs.enable = true;
+}
+```
+
+Works the same under nix-darwin and NixOS.
+
+## NixOS
+
+```nix
+{
+  inputs.ghfs.url = "github:rgodha24/ghfs";
+
+  outputs = { nixpkgs, ghfs, ... }: {
+    nixosConfigurations.myBox = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ghfs.nixosModules.default
+        { services.ghfs.enable = true; }
+      ];
+    };
+  };
+}
+```
