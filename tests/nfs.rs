@@ -400,7 +400,7 @@ async fn slow_request_does_not_block_others() {
     });
     let repos = ghfs::repos::Repos::new(
         paths,
-        ghfs::git::GitCli::with_base_url(format!("http://127.0.0.1:{hang_port}")),
+        ghfs::git::GitRemote::with_base_url(format!("http://127.0.0.1:{hang_port}")),
     );
     let vfs = ghfs::vfs::Vfs::new(repos);
     let (listener, port) = ghfs::nfs::bind().await.unwrap();
@@ -458,7 +458,7 @@ async fn many_concurrent_clients() {
         t.await.unwrap();
     }
     // Every file in many/ arrived in one directory batch.
-    assert!(env.pack_count("octo", "hello") <= 3);
+    assert!(env.fetch_count() <= 3);
 }
 
 /// Other local users going through the mount are refused: the kernel stamps

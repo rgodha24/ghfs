@@ -4,9 +4,11 @@ description: Fetching, caching, and mounting.
 ---
 
 - **Mounting.** Linux uses FUSE. macOS uses a small NFSv3 server on localhost, mounted with `mount_nfs`. The NFS server only answers requests from your uid (or root).
-- **HEAD.** Resolved with `git ls-remote` and cached in memory and on disk. Stale values are served right away and refreshed in the background.
-- **Commits.** Fetched shallow and without blobs (`--depth=1 --filter=blob:none`), so opening a huge repo is cheap.
-- **Files.** Blobs are fetched per directory in one `git fetch --stdin` batch. Listing a directory prefetches its subtree in the background.
+- **HEAD.** Resolved with Git protocol-v2 `ls-refs` and cached in memory and on disk. Stale values are served right away and refreshed in the background.
+- **Commits.** Fetched shallow and without blobs (`deepen 1`, `filter blob:none`), so opening a huge repo is cheap.
+- **Files.** Blobs are fetched per directory in explicit-want batches. Listing a directory prefetches its subtree in the background.
 - **Dedup.** Concurrent requests for the same commit or directory share one fetch.
+- **Objects.** HTTPS responses spool to temporary packs. Disk-backed delta decoding writes loose objects into the v3 cache, then removes staging; no git subprocesses, retained packs or repacking. Old v2 data stays unused.
+- **Recovery.** A commit completion marker is written only after its full tree closure validates. Each daemon run revalidates a marked closure on first use; interrupted or corrupt fetches are repaired.
 - **Cache.** File contents live in a content-addressed cache, written once per blob. `ghfs gc` drops contents unused for a week; they're rebuilt from local git objects without the network.
 - **Async.** Everything runs on one tokio runtime, and each filesystem request is its own task, so a slow fetch never blocks other reads.

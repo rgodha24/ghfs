@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use ghfs::git::GitCli;
+use ghfs::git::GitRemote;
 use ghfs::paths::CachePaths;
 use ghfs::repos::Repos;
 use ghfs::vfs::Vfs;
@@ -63,8 +63,8 @@ impl Remote {
         format!("file://{}", self.root.display())
     }
 
-    pub fn cli(&self) -> GitCli {
-        GitCli::with_base_url(self.base_url())
+    pub fn cli(&self) -> GitRemote {
+        GitRemote::with_transport(self.base_url(), Arc::new(UploadPack))
     }
 
     /// Create `<owner>/<repo>.git` with the given files (path, contents) on main.
@@ -124,6 +124,7 @@ pub struct Env {
     pub remote: Remote,
     pub cache: tempfile::TempDir,
     pub repos: Arc<Repos>,
+    pub git: GitRemote,
     pub vfs: Arc<Vfs>,
 }
 
@@ -136,10 +137,12 @@ impl Env {
         let cache = tempfile::tempdir().unwrap();
         let paths = CachePaths::new(cache.path());
         paths.create_dirs().unwrap();
-        let repos = Repos::new(paths, remote.cli());
+        let git = remote.cli();
+        let repos = Repos::new(paths, git.clone());
         let vfs = Vfs::new(repos.clone());
         Self {
             remote,
+            git,
             cache,
             repos,
             vfs,
@@ -178,8 +181,190 @@ impl Env {
             .collect()
     }
 
-    pub fn pack_count(&self, owner: &str, repo: &str) -> usize {
-        let key = format!("{owner}/{repo}").parse().unwrap();
-        ghfs::git::odb::pack_count(&CachePaths::new(self.cache.path()).repo_dir(&key))
+    pub fn fetch_count(&self) -> u64 {
+        self.git.stats().fetch_requests
+    }
+
+    pub fn assert_loose_only(&self) {
+        for key in self.repos.paths().cached_repos() {
+            let dir = self.repos.paths().repo_dir(&key);
+            let packs = dir.join("objects/pack");
+            assert!(
+                std::fs::read_dir(packs).unwrap().next().is_none(),
+                "retained packs/indexes"
+            );
+            let staging = dir.join("ghfs-staging");
+            if staging.is_dir() {
+                assert!(
+                    std::fs::read_dir(staging).unwrap().next().is_none(),
+                    "staging not cleaned"
+                );
+            }
+        }
+    }
+}
+
+/// The library never shells out to git. Only this fixture transport does.
+#[derive(Debug)]
+pub struct UploadPack;
+
+impl ghfs::git::transport::Transport for UploadPack {
+    fn discover<'a>(&'a self, url: &'a str) -> ghfs::git::transport::TransportFuture<'a> {
+        Box::pin(upload_pack(url, None))
+    }
+
+    fn command<'a>(
+        &'a self,
+        url: &'a str,
+        body: bytes::Bytes,
+    ) -> ghfs::git::transport::TransportFuture<'a> {
+        Box::pin(upload_pack(url, Some(body)))
+    }
+}
+
+async fn upload_pack(
+    url: &str,
+    body: Option<bytes::Bytes>,
+) -> Result<ghfs::git::transport::Response, ghfs::git::GitError> {
+    use ghfs::git::transport::Response;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = url
+        .strip_prefix("file://")
+        .ok_or_else(|| ghfs::git::GitError::Transport("fixture expected file://".into()))?;
+    let discovery = body.is_none();
+    if !std::path::Path::new(path).join("objects").is_dir() {
+        return Ok(Response {
+            status: 404,
+            content_type: None,
+            body: Box::pin(std::io::Cursor::new(Vec::<u8>::new())),
+        });
+    }
+    let mut command = tokio::process::Command::new("git");
+    command.arg("upload-pack").arg("--stateless-rpc");
+    if discovery {
+        command.arg("--advertise-refs");
+    }
+    command
+        .arg(path)
+        .env("GIT_PROTOCOL", "version=2")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = tokio::spawn(async move {
+        if let Some(body) = body {
+            let _ = stdin.write_all(&body).await;
+        }
+        let _ = stdin.shutdown().await;
+    });
+    let stderr = child.stderr.take().unwrap();
+    let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task_errors = errors.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut buffer = [0; 4096];
+        while let Ok(n) = stderr.read(&mut buffer).await {
+            if n == 0 {
+                break;
+            }
+            let mut errors = task_errors.lock().unwrap();
+            let remaining = 64 * 1024 - errors.len();
+            errors.extend_from_slice(&buffer[..n.min(remaining)]);
+        }
+    });
+    let exit = tokio::spawn(async move { child.wait().await });
+    Ok(Response {
+        status: 200,
+        content_type: Some(
+            if discovery {
+                "application/x-git-upload-pack-advertisement"
+            } else {
+                "application/x-git-upload-pack-result"
+            }
+            .into(),
+        ),
+        body: Box::pin(UploadBody {
+            stdout,
+            pid,
+            writer,
+            stderr_task,
+            exit,
+            errors,
+            done: false,
+        }),
+    })
+}
+
+struct UploadBody {
+    stdout: tokio::process::ChildStdout,
+    pid: Option<u32>,
+    writer: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    exit: tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    errors: Arc<std::sync::Mutex<Vec<u8>>>,
+    done: bool,
+}
+
+impl tokio::io::AsyncRead for UploadBody {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::Poll;
+        if self.done || buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let before = buffer.filled().len();
+        match Pin::new(&mut self.stdout).poll_read(cx, buffer) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) if buffer.filled().len() != before => return Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => {}
+        }
+        match Pin::new(&mut self.exit).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(status))) => {
+                self.done = true;
+                if status.success() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(std::io::Error::other(format!(
+                        "upload-pack: {}",
+                        String::from_utf8_lossy(&self.errors.lock().unwrap())
+                    ))))
+                }
+            }
+            Poll::Ready(error) => {
+                self.done = true;
+                Poll::Ready(Err(std::io::Error::other(format!(
+                    "upload-pack wait: {error:?}"
+                ))))
+            }
+        }
+    }
+}
+
+impl Drop for UploadBody {
+    fn drop(&mut self) {
+        if !self.done
+            && let Some(pid) = self.pid
+        {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        self.writer.abort();
+        self.stderr_task.abort();
+        self.exit.abort();
     }
 }

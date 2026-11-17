@@ -1,0 +1,10 @@
+[package]
+name="ghfs-pack-spike"
+version="0.0.0"
+edition="2024"
+[dependencies]
+gix-pack={version="=0.77.0", default-features=false, features=["sha1"]}
+flate2="1"
+sha1="0.10"
+
+[workspace]

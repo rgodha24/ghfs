@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::git::GitCli;
+use crate::git::GitRemote;
 use crate::paths::CachePaths;
 use crate::repos::Repos;
 use crate::vfs::Vfs;
@@ -64,12 +64,12 @@ pub fn start() -> Result<(), DaemonError> {
     let result = runtime.block_on(run());
     let _ = std::fs::remove_file(pid_file_path());
     let _ = std::fs::remove_file(socket_path());
-    // Don't wait on stuck blocking tasks (e.g. a git subprocess) at exit.
+    // Remote workers have already been cancelled and joined before runtime exit.
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
 
-/// A file server holds many pack files, cached blobs, git pipes and client
+/// A file server holds many loose objects, cached blobs and client
 /// sockets at once; macOS's default soft limit of 256 is far too low.
 pub fn raise_fd_limit() {
     let mut lim = libc::rlimit {
@@ -104,6 +104,10 @@ async fn run() -> Result<(), DaemonError> {
     log::info!("Cache: {}", paths.root().display());
 
     paths.create_dirs()?;
+    let abandoned = paths.clone();
+    tokio::task::spawn_blocking(move || abandoned.remove_abandoned_staging())
+        .await
+        .map_err(|e| DaemonError::Io(std::io::Error::other(e)))??;
     // Old mirrors can be many GB; deleting them must not delay the mount.
     let legacy = paths.clone();
     tokio::task::spawn_blocking(move || {
@@ -113,7 +117,7 @@ async fn run() -> Result<(), DaemonError> {
         }
     });
 
-    let repos = Repos::new(paths, GitCli::new());
+    let repos = Repos::new(paths, GitRemote::new());
     let vfs = Vfs::new(repos.clone());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -127,14 +131,13 @@ async fn run() -> Result<(), DaemonError> {
             shutdown: shutdown_tx.clone(),
         }),
     ));
-    let maintenance_task = tokio::spawn(maintenance::run(repos.clone()));
     tokio::spawn(forward_signals(shutdown_tx.clone()));
 
     prepare_mount_point(&mount_point).await?;
     let result = mount_and_wait(vfs, &mount_point, shutdown_rx).await;
 
     socket_task.abort();
-    maintenance_task.abort();
+    repos.shutdown().await;
     log::info!("ghfs daemon stopped");
     result
 }

@@ -18,10 +18,7 @@ in {
     }
 
     (lib.mkIf pkgs.stdenv.isLinux {
-      home.packages = [
-        pkgs.git
-        pkgs.fuse3
-      ];
+      home.packages = [pkgs.fuse3];
 
       systemd.user.services.ghfs = {
         Unit = {
@@ -35,7 +32,7 @@ in {
           RestartSec = 5;
           Environment = [
             "RUST_LOG=info"
-            "PATH=/run/wrappers/bin:${lib.makeBinPath [ cfg.package pkgs.git pkgs.fuse3 ]}:/usr/bin:/bin:/usr/sbin:/sbin"
+            "PATH=/run/wrappers/bin:${lib.makeBinPath [ cfg.package pkgs.gh pkgs.fuse3 ]}:/usr/bin:/bin:/usr/sbin:/sbin"
           ];
         };
         Install = {
@@ -56,7 +53,7 @@ in {
           StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/ghfs.err.log";
           EnvironmentVariables = {
             RUST_LOG = "info";
-            PATH = "${lib.makeBinPath [ cfg.package pkgs.git ]}:/usr/bin:/bin:/usr/sbin:/sbin";
+            PATH = "${lib.makeBinPath [ cfg.package pkgs.gh ]}:/usr/bin:/bin:/usr/sbin:/sbin";
           };
         };
       };

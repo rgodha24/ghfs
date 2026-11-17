@@ -1,44 +1,21 @@
-//! Background upkeep: periodic repacks and `ghfs gc`.
+//! Explicit age-out of materialized blobs via `ghfs gc`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::git::odb;
 use crate::protocol::GcResult;
 use crate::repos::Repos;
 
-const REPACK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Materialized blobs untouched for this long are dropped by `ghfs gc`; they
-/// can be recreated from the local pack without the network.
+/// can be recreated from the local loose objects without the network.
 const BLOB_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// Repack repos that have piled up packs (e.g. from a previous run), on
-/// startup and then periodically.
-pub async fn run(repos: Arc<Repos>) {
-    let mut interval = tokio::time::interval(REPACK_INTERVAL);
-    loop {
-        interval.tick().await;
-        for key in repos.paths().cached_repos() {
-            repos.get(&key).maybe_repack();
-        }
-    }
-}
-
 pub async fn gc(repos: &Arc<Repos>) -> GcResult {
-    let mut repacked = 0;
-    for key in repos.paths().cached_repos() {
-        let handle = repos.get(&key);
-        if odb::pack_count(handle.dir()) > 1 {
-            handle.repack().await;
-            repacked += 1;
-        }
-    }
     let blobs_dir = repos.paths().blobs_dir();
     let (removed, freed) = tokio::task::spawn_blocking(move || remove_old_blobs(&blobs_dir))
         .await
         .unwrap_or((0, 0));
     GcResult {
-        repos_repacked: repacked,
         blobs_removed: removed,
         bytes_freed: freed,
     }

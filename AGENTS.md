@@ -6,15 +6,18 @@ Read-only filesystem that exposes GitHub repos at `/<owner>/<repo>` (default bra
 
 - Everything async runs on one tokio runtime. FUSE callbacks and NFS RPCs each run as their own task, so a slow fetch never blocks other requests.
 - `src/vfs/` is the shared filesystem core; `src/repos.rs` owns per-repo state.
-- HEAD comes from `git ls-remote` and is cached (memory + `ghfs-head` file); stale values are served immediately and refreshed in the background, so only the very first visit to a repo waits on the network.
-- Each commit is fetched shallowly without blobs (`--depth=1 --filter=blob:none`). Blobs are fetched per directory in one batch (`git fetch --stdin`), and listing a directory prefetches its subtree in the background.
-- Concurrent requests for the same commit/directory share one fetch (`src/singleflight.rs`). Repos are repacked once packs pile up.
-- Cache layout lives in `src/paths.rs`; directories older versions created next to `v2/` are deleted on daemon start.
+- HEAD comes from Git protocol-v2 `ls-refs` and is cached (memory + `ghfs-head` file); stale values are served immediately and refreshed in the background, so only the very first visit to a repo waits on the network.
+- Each commit is fetched shallowly without blobs (`deepen 1`, `filter blob:none`). Blobs are fetched per directory in explicit-want batches; listing a directory prefetches its subtree in the background. HTTPS/protocol framing lives in `src/git/{transport,wire,remote}.rs`.
+- Concurrent requests for the same commit/directory share one fetch (`src/singleflight.rs`). Fetches spool temporarily, then bounded disk-backed delta decoding writes only loose objects (`src/git/{pack,loose}.rs`). No persistent packs, git subprocesses, or repacks.
+- Cache layout lives in `src/paths.rs`; the new store is `v3/`. Old `v2/` is retained unused; abandoned v3 transfers are removed before requests start.
 - The NFS server only answers the daemon user's uid (AUTH_UNIX credential; root allowed). A process that connects to the port directly can forge that, so this only stops other users going through the mount.
-- Blob contents are served from a content-addressed file cache (`v2/blobs`), written once per blob; files are checked against the object size on first use each run instead of being fsynced.
+- Blob contents are served from a content-addressed file cache (`v3/blobs`), written once per blob; files are checked against the object size on first use each run instead of being fsynced.
 - macOS mount options matter: `soft,nobrowse` suppresses the "Server connections interrupted" dialog, `dumbtimer,timeo=300,retrans=10` keeps slow first fetches from timing out (see `src/nfs/mod.rs`).
 
 ## Testing
+
+Linux builds/tests run on Tesser devboxes: see `.agents/skills/tesser/SKILL.md`.
+macOS checks run natively through `ssh mac` in an isolated checkout.
 
 `tests/` runs hermetically against `file://` remotes (no network). For a real mount without touching the installed service, point the daemon at scratch paths:
 

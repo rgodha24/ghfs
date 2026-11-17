@@ -1,28 +1,23 @@
-//! Async wrappers around the `git` CLI for everything that touches the network.
-//!
-//! libgit2 can't do partial or shallow fetches reliably, so network work goes
-//! through `git` subprocesses on tokio. Every command has a wall-clock timeout
-//! and a low-speed abort, so one stalled connection can't hang a request for
-//! minutes.
+//! Protocol-v2 remote operations with bounded staging and supervised workers.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use git2::Oid;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
-use super::GitError;
+use super::operation::{Budget, Limits, Work, Workers};
+use super::transport::{HttpsTransport, Response, Transport};
+use super::{GitError, loose, pack, wire};
 
-/// Abort transfers slower than 1 KiB/s for this many seconds.
-const LOW_SPEED_TIME_SECS: u32 = 20;
-/// Most `git` processes running at once, so a burst of directory prefetches
-/// can't fork hundreds of clients at GitHub.
-const MAX_CONCURRENT_GIT: usize = 24;
-
+const OPERATIONS: usize = 24;
+const DECODERS: usize = 2;
+const CAPABILITY_TTL: Duration = Duration::from_secs(300);
+const MAX_CAPABILITY_ENTRIES: usize = 256;
 /// Remote refs as reported by `git ls-remote`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteRefs {
@@ -106,314 +101,676 @@ pub fn parse_ls_remote(output: &str) -> RemoteRefs {
     out
 }
 
-/// Classify git stderr: GitHub answers unknown and private-without-creds repos
-/// the same way, and both mean "not found" to us.
-fn classify_failure(stderr: &str) -> GitError {
-    let lower = stderr.to_ascii_lowercase();
-    if lower.contains("repository not found")
-        || lower.contains("could not read username")
-        || lower.contains("terminal prompts disabled")
-        || lower.contains("not our ref")
-        || lower.contains("couldn't find remote ref")
-        || lower.contains("does not appear to be a git repository")
-    {
-        return GitError::RepoNotFound(redact_creds(stderr.trim()));
-    }
-    GitError::Command(redact_creds(stderr.trim()))
+struct CapabilityEntry {
+    created: Instant,
+    value: Arc<OnceCell<wire::Capabilities>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct GitCli {
-    /// Base URL; repos are `<base>/<owner>/<repo>.git`. Overridable for tests.
-    base_url: String,
+struct Inner {
+    transport: Arc<dyn Transport>,
+    capabilities: Mutex<HashMap<(String, u64), CapabilityEntry>>,
     slots: Arc<Semaphore>,
+    decoders: Arc<Semaphore>,
+    shutdown: CancellationToken,
+    workers: Arc<Workers>,
+    spool_budget: Arc<Budget>,
+    decode_budget: Arc<Budget>,
+    limits: Limits,
+    reference_requests: AtomicU64,
+    discovery_requests: AtomicU64,
+    fetch_requests: AtomicU64,
 }
 
-impl Default for GitCli {
+#[derive(Clone)]
+pub struct GitRemote {
+    base_url: String,
+    inner: Arc<Inner>,
+    timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for GitRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitRemote")
+            .field("base_url", &redact_creds(&self.base_url))
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RemoteStats {
+    pub reference_requests: u64,
+    pub discovery_requests: u64,
+    pub fetch_requests: u64,
+    pub spool_bytes: u64,
+    pub spool_peak_bytes: u64,
+    pub decode_bytes: u64,
+    pub decode_peak_bytes: u64,
+    pub available_operation_slots: usize,
+    pub available_decoder_slots: usize,
+}
+
+impl Default for GitRemote {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl GitCli {
+impl GitRemote {
     pub fn new() -> Self {
-        let base_url =
-            std::env::var("GHFS_GIT_BASE_URL").unwrap_or_else(|_| "https://github.com".to_string());
-        Self::with_base_url(base_url)
+        Self::with_base_url(
+            std::env::var("GHFS_GIT_BASE_URL").unwrap_or_else(|_| "https://github.com".to_owned()),
+        )
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        let transport = Arc::new(HttpsTransport::new(&base_url));
+        Self::with_transport(base_url, transport)
+    }
+
+    pub fn with_transport(base_url: impl Into<String>, transport: Arc<dyn Transport>) -> Self {
         Self {
             base_url: base_url.into(),
-            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
+            inner: Arc::new(Inner {
+                transport,
+                capabilities: Mutex::new(HashMap::new()),
+                slots: Arc::new(Semaphore::new(OPERATIONS)),
+                decoders: Arc::new(Semaphore::new(DECODERS)),
+                shutdown: CancellationToken::new(),
+                workers: Arc::new(Workers::default()),
+                spool_budget: Budget::new("downloaded packs", 2 << 30),
+                decode_budget: Budget::new("expanded objects", 4 << 30),
+                limits: Limits::default(),
+                reference_requests: AtomicU64::new(0),
+                discovery_requests: AtomicU64::new(0),
+                fetch_requests: AtomicU64::new(0),
+            }),
+            timeout: None,
         }
+    }
+
+    /// Override the complete operation deadline, including queueing and retries.
+    pub fn with_operation_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     pub fn url(&self, owner: &str, repo: &str) -> String {
         format!("{}/{owner}/{repo}.git", self.base_url.trim_end_matches('/'))
     }
 
-    fn command(&self, dir: Option<&Path>) -> Command {
-        let mut cmd = Command::new("git");
-        if let Some(dir) = dir {
-            cmd.arg("-C").arg(dir);
-        }
-        cmd.args([
-            "-c",
-            "protocol.version=2",
-            "-c",
-            "http.lowSpeedLimit=1024",
-            "-c",
-            &format!("http.lowSpeedTime={LOW_SPEED_TIME_SECS}"),
-            "-c",
-            "gc.auto=0",
-            "-c",
-            "maintenance.auto=false",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-        cmd
+    fn work(&self, timeout: Duration) -> Work {
+        Work::with_token(
+            self.timeout.unwrap_or(timeout),
+            self.inner.shutdown.child_token(),
+        )
     }
 
-    async fn run(
-        &self,
-        mut cmd: Command,
-        stdin: Option<Vec<u8>>,
-        timeout: Duration,
-    ) -> Result<String, GitError> {
-        let _slot = self.slots.acquire().await.expect("semaphore never closed");
-        if stdin.is_some() {
-            cmd.stdin(Stdio::piped());
-        }
-        let mut child = cmd.spawn().map_err(GitError::Spawn)?;
-        if let Some(input) = stdin {
-            let mut pipe = child.stdin.take().expect("stdin piped");
-            // Write concurrently with waiting so a large input can't deadlock
-            // against a full stdout pipe.
-            tokio::spawn(async move {
-                let _ = pipe.write_all(&input).await;
-                let _ = pipe.shutdown().await;
-            });
-        }
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(result) => result.map_err(GitError::Spawn)?,
-            Err(_) => return Err(GitError::Timeout(timeout)),
-        };
-        if !output.status.success() {
-            return Err(classify_failure(&String::from_utf8_lossy(&output.stderr)));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    async fn acquire(
+        semaphore: &Arc<Semaphore>,
+        work: &Work,
+    ) -> Result<OwnedSemaphorePermit, GitError> {
+        work.wait(async {
+            semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| GitError::Cancelled)
+        })
+        .await
     }
 
-    /// Resolve HEAD only. One small round trip.
+    fn response(response: Response, expected: &str) -> Result<Response, GitError> {
+        match response.status {
+            200 => {}
+            404 => {
+                return Err(GitError::RepoNotFound(
+                    "remote repository is unavailable".into(),
+                ));
+            }
+            status => return Err(GitError::Transport(format!("remote HTTP status {status}"))),
+        }
+        let actual = response
+            .content_type
+            .as_deref()
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(GitError::Protocol("unexpected HTTP content type".into()));
+        }
+        Ok(response)
+    }
+
+    async fn capabilities(&self, url: &str, work: &Work) -> Result<wire::Capabilities, GitError> {
+        let identity = work
+            .wait(async { Ok(self.inner.transport.identity(url).await) })
+            .await?;
+        let key = (url.to_owned(), identity);
+        let cell = work
+            .wait(async {
+                let mut cache = self.inner.capabilities.lock().await;
+                cache.retain(|_, entry| entry.created.elapsed() < CAPABILITY_TTL);
+                if !cache.contains_key(&key)
+                    && cache.len() >= MAX_CAPABILITY_ENTRIES
+                    && let Some(key) = cache.keys().next().cloned()
+                {
+                    cache.remove(&key);
+                }
+                Ok(cache
+                    .entry(key)
+                    .or_insert_with(|| CapabilityEntry {
+                        created: Instant::now(),
+                        value: Arc::new(OnceCell::new()),
+                    })
+                    .value
+                    .clone())
+            })
+            .await?;
+        work.wait(async {
+            cell.get_or_try_init(|| async {
+                self.inner
+                    .discovery_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                let response = self.inner.transport.discover(url).await?;
+                let response =
+                    Self::response(response, "application/x-git-upload-pack-advertisement")?;
+                wire::advertisement(response.body, work).await
+            })
+            .await
+            .cloned()
+        })
+        .await
+    }
+
+    async fn ls_refs(&self, url: &str, all: bool) -> Result<RemoteRefs, GitError> {
+        let work = self.work(if all {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(30)
+        });
+        let _cancel = work.cancel_on_drop();
+        let _slot = Self::acquire(&self.inner.slots, &work).await?;
+        self.capabilities(url, &work).await?.require_refs()?;
+        let mut args = vec!["symrefs".into(), "peel".into(), "ref-prefix HEAD".into()];
+        if all {
+            args.extend([
+                "ref-prefix refs/heads/".into(),
+                "ref-prefix refs/tags/".into(),
+            ]);
+        }
+        self.inner
+            .reference_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let response = work
+            .wait(
+                self.inner
+                    .transport
+                    .command(url, wire::command("ls-refs", args)),
+            )
+            .await?;
+        let response = Self::response(response, "application/x-git-upload-pack-result")?;
+        wire::refs(response.body, &work, all).await
+    }
+
     pub async fn ls_remote_head(&self, url: &str) -> Result<RemoteRefs, GitError> {
-        let mut cmd = self.command(None);
-        cmd.args(["ls-remote", "--symref", url, "HEAD"]);
-        let out = self.run(cmd, None, Duration::from_secs(30)).await?;
-        let refs = parse_ls_remote(&out);
+        let refs = self.ls_refs(url, false).await?;
         if refs.head.is_none() {
-            return Err(GitError::RepoNotFound(format!("{url} has no HEAD")));
+            return Err(GitError::RepoNotFound("remote has no HEAD".into()));
         }
         Ok(refs)
     }
 
-    /// HEAD plus all branches and tags (no `refs/pull/*`, which can be huge).
     pub async fn ls_remote_all(&self, url: &str) -> Result<RemoteRefs, GitError> {
-        let mut cmd = self.command(None);
-        cmd.args([
-            "ls-remote",
-            "--symref",
-            url,
-            "HEAD",
-            "refs/heads/*",
-            "refs/tags/*",
-        ]);
-        let out = self.run(cmd, None, Duration::from_secs(60)).await?;
-        Ok(parse_ls_remote(&out))
+        self.ls_refs(url, true).await
     }
 
-    /// Create an empty bare repo configured as a blobless partial clone of `url`.
+    /// Initialize privately, then publish the complete bare repository directory.
     pub async fn init_repo(&self, dir: &Path, url: &str) -> Result<(), GitError> {
-        let mut cmd = self.command(None);
-        cmd.args(["init", "-q", "--bare"]).arg(dir);
-        self.run(cmd, None, Duration::from_secs(30)).await?;
-        for (key, value) in [
-            ("core.repositoryformatversion", "1"),
-            ("extensions.partialClone", "origin"),
-            ("remote.origin.url", url),
-            ("remote.origin.promisor", "true"),
-            ("remote.origin.partialclonefilter", "blob:none"),
-            ("gc.auto", "0"),
-            ("maintenance.auto", "false"),
-            ("fetch.writeCommitGraph", "false"),
-        ] {
-            let mut cmd = self.command(Some(dir));
-            cmd.args(["config", key, value]);
-            self.run(cmd, None, Duration::from_secs(30)).await?;
+        let work = self.work(Duration::from_secs(30));
+        let _cancel = work.cancel_on_drop();
+        let slot = Self::acquire(&self.inner.slots, &work).await?;
+        let dir = dir.to_owned();
+        let url = url.to_owned();
+        let worker_work = work.clone();
+        work.wait(self.inner.workers.run(work.clone(), move || {
+            let _slot = slot;
+            worker_work.check()?;
+            if dir.join("objects").is_dir() {
+                return Ok(());
+            }
+            let parent = dir
+                .parent()
+                .ok_or_else(|| GitError::Command("repository has no parent".into()))?;
+            std::fs::create_dir_all(parent)?;
+            let temp = tempfile::Builder::new()
+                .prefix(".ghfs-init-")
+                .tempdir_in(parent)?;
+            let repository = git2::Repository::init_bare(temp.path())?;
+            repository.config()?.set_str("remote.origin.url", &url)?;
+            drop(repository);
+            worker_work.check()?;
+            match std::fs::rename(temp.path(), &dir) {
+                Ok(()) => Ok(()),
+                Err(_) if dir.join("objects").is_dir() => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }))
+        .await
+    }
+
+    async fn remote_url(&self, dir: &Path, work: &Work) -> Result<String, GitError> {
+        let slot = Self::acquire(&self.inner.slots, work).await?;
+        let dir = dir.to_owned();
+        work.wait(self.inner.workers.run(work.clone(), move || {
+            let _slot = slot;
+            let repository = git2::Repository::open_bare(dir)?;
+            let url = repository.config()?.get_string("remote.origin.url")?;
+            if url.len() > 8192 {
+                return Err(GitError::ResourceLimit("remote URL too long".into()));
+            }
+            Ok(url)
+        }))
+        .await
+    }
+
+    async fn fetch_once(
+        &self,
+        dir: &Path,
+        url: &str,
+        wants: &[Oid],
+        commit: Option<Oid>,
+        work: &Work,
+    ) -> Result<(), GitError> {
+        let slot = Self::acquire(&self.inner.slots, work).await?;
+        self.capabilities(url, work)
+            .await?
+            .require_fetch(commit.is_some())?;
+        let dir = dir.to_owned();
+        let setup_dir = dir.clone();
+        let (slot, staging) = work
+            .wait(self.inner.workers.run(work.clone(), move || {
+                let parent = setup_dir.join("ghfs-staging");
+                std::fs::create_dir_all(&parent)?;
+                let staging = tempfile::Builder::new()
+                    .prefix("transfer-")
+                    .tempdir_in(parent)?;
+                Ok((slot, staging))
+            }))
+            .await?;
+        let mut args: Vec<String> = wants.iter().map(|oid| format!("want {oid}")).collect();
+        args.extend([
+            "filter blob:none".into(),
+            "ofs-delta".into(),
+            "no-progress".into(),
+        ]);
+        if commit.is_some() {
+            args.push("deepen 1".into());
         }
-        Ok(())
+        args.push("done".into());
+        self.inner.fetch_requests.fetch_add(1, Ordering::Relaxed);
+        let response = work
+            .wait(
+                self.inner
+                    .transport
+                    .command(url, wire::command("fetch", args)),
+            )
+            .await?;
+        let response = Self::response(response, "application/x-git-upload-pack-result")?;
+        let path = staging.path().join("transfer.pack");
+        let mut output = work
+            .wait(async { tokio::fs::File::create(&path).await.map_err(GitError::Io) })
+            .await?;
+        let mut reservation = self.inner.spool_budget.reserve(0)?;
+        wire::fetch(
+            response.body,
+            work,
+            &mut output,
+            &mut reservation,
+            &self.inner.limits,
+            wants[0],
+        )
+        .await?;
+        // flush in wire::fetch completes pending asynchronous writes.
+        drop(output);
+        let decoder = Self::acquire(&self.inner.decoders, work).await?;
+        let wants = wants.to_vec();
+        let limits = self.inner.limits.clone();
+        let budget = self.inner.decode_budget.clone();
+        let worker_work = work.clone();
+        work.wait(self.inner.workers.run(work.clone(), move || {
+            let (_slot, _decoder, _spool) = (slot, decoder, reservation);
+            pack::ingest(
+                &dir,
+                staging.path(),
+                &path,
+                &wants,
+                commit,
+                &worker_work,
+                &limits,
+                &budget,
+            )
+        }))
+        .await
     }
 
-    /// Fetch one commit and all of its trees, but no blobs and no history.
     pub async fn fetch_commit(&self, dir: &Path, commit: Oid) -> Result<(), GitError> {
-        let mut cmd = self.command(Some(dir));
-        cmd.args([
-            "fetch",
-            "-q",
-            "--depth=1",
-            "--filter=blob:none",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--recurse-submodules=no",
-            "origin",
-        ])
-        .arg(commit.to_string());
-        self.run(cmd, None, Duration::from_secs(300)).await?;
-        Ok(())
+        let work = self.work(Duration::from_secs(300));
+        let _cancel = work.cancel_on_drop();
+        let url = self.remote_url(dir, &work).await?;
+        self.fetch_once(dir, &url, &[commit], Some(commit), &work)
+            .await
     }
 
-    /// Fetch specific blobs in one round trip (what git's own promisor
-    /// backfill does, but batched).
     pub async fn fetch_blobs(&self, dir: &Path, blobs: &[Oid]) -> Result<(), GitError> {
         if blobs.is_empty() {
             return Ok(());
         }
-        let mut input = String::with_capacity(blobs.len() * 41);
-        for oid in blobs {
-            input.push_str(&oid.to_string());
-            input.push('\n');
+        let work = self.work(Duration::from_secs(600));
+        let _cancel = work.cancel_on_drop();
+        let url = self.remote_url(dir, &work).await?;
+        // A single unfetchable want (over the size limit, or rejected by the
+        // server) must not strand the rest of the batch: remember its error,
+        // keep fetching the others, and report it at the end.
+        let mut deferred = None;
+        for chunk in blobs.chunks(self.inner.limits.max_wants) {
+            let mut pending = vec![chunk];
+            while let Some(wants) = pending.pop() {
+                match self.fetch_once(dir, &url, wants, None, &work).await {
+                    Err(GitError::ResourceLimit(_) | GitError::MissingObject(_))
+                        if wants.len() > 1 =>
+                    {
+                        // The previous attempt has returned and dropped all its
+                        // staging/quota guards. Global Quota failures never split.
+                        let (left, right) = wants.split_at(wants.len() / 2);
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    Err(error @ (GitError::ResourceLimit(_) | GitError::MissingObject(_))) => {
+                        deferred.get_or_insert(error);
+                    }
+                    result => result?,
+                }
+            }
         }
-        let mut cmd = self.command(Some(dir));
-        cmd.args([
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "fetch",
-            "-q",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--recurse-submodules=no",
-            "--filter=blob:none",
-            "origin",
-            "--stdin",
-        ]);
-        self.run(cmd, Some(input.into_bytes()), Duration::from_secs(600))
-            .await?;
-        Ok(())
+        deferred.map_or(Ok(()), Err)
     }
 
-    /// Write a local blob's contents to `out`, streamed (no full copy in
-    /// memory). Never lazily fetches: the caller makes sure the blob is local.
     pub async fn cat_blob_to_file(
         &self,
         dir: &Path,
         blob: Oid,
         out: std::fs::File,
     ) -> Result<(), GitError> {
-        let mut cmd = self.command(Some(dir));
-        cmd.env("GIT_NO_LAZY_FETCH", "1")
-            .args(["cat-file", "blob"])
-            .arg(blob.to_string())
-            .stdout(Stdio::from(out));
-        self.run(cmd, None, Duration::from_secs(600)).await?;
-        Ok(())
+        let work = self.work(Duration::from_secs(600));
+        let _cancel = work.cancel_on_drop();
+        let slot = Self::acquire(&self.inner.slots, &work).await?;
+        let decoder = Self::acquire(&self.inner.decoders, &work).await?;
+        let dir = dir.to_owned();
+        let limits = self.inner.limits.clone();
+        let worker_work = work.clone();
+        work.wait(self.inner.workers.run(work.clone(), move || {
+            let (_slot, _decoder) = (slot, decoder);
+            loose::copy_blob(&dir, blob, out, &worker_work, &limits)
+        }))
+        .await
     }
 
-    /// Consolidate packs. Every fetch leaves a pack behind, and object lookup
-    /// cost grows with the pack count.
-    pub async fn repack(&self, dir: &Path) -> Result<(), GitError> {
-        let mut cmd = self.command(Some(dir));
-        cmd.args(["repack", "-a", "-d", "-q", "--no-write-bitmap-index"]);
-        self.run(cmd, None, Duration::from_secs(1800)).await?;
-        Ok(())
+    pub async fn validate_commit(&self, dir: &Path, oid: Oid) -> Result<(Oid, i64), GitError> {
+        let work = self.work(Duration::from_secs(300));
+        let _cancel = work.cancel_on_drop();
+        let slot = Self::acquire(&self.inner.slots, &work).await?;
+        let decoder = Self::acquire(&self.inner.decoders, &work).await?;
+        let dir = dir.to_owned();
+        let limits = self.inner.limits.clone();
+        let worker_work = work.clone();
+        work.wait(self.inner.workers.run(work.clone(), move || {
+            let (_slot, _decoder) = (slot, decoder);
+            loose::validate_commit(&dir, oid, &worker_work, &limits)
+        }))
+        .await
+    }
+
+    pub fn stats(&self) -> RemoteStats {
+        RemoteStats {
+            reference_requests: self.inner.reference_requests.load(Ordering::Relaxed),
+            discovery_requests: self.inner.discovery_requests.load(Ordering::Relaxed),
+            fetch_requests: self.inner.fetch_requests.load(Ordering::Relaxed),
+            spool_bytes: self.inner.spool_budget.used(),
+            spool_peak_bytes: self.inner.spool_budget.peak(),
+            decode_bytes: self.inner.decode_budget.used(),
+            decode_peak_bytes: self.inner.decode_budget.peak(),
+            available_operation_slots: self.inner.slots.available_permits(),
+            available_decoder_slots: self.inner.decoders.available_permits(),
+        }
+    }
+
+    /// Stop admission and HTTP work, cancel and join every registered worker.
+    pub async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+        self.inner.slots.close();
+        self.inner.decoders.close();
+        self.inner.workers.shutdown().await;
     }
 }
 
-/// Redact `user:token@` from URLs in git error output.
+/// Redact embedded URL credentials when describing configuration.
 pub fn redact_creds(s: &str) -> String {
-    let needle = "https://";
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(idx) = rest.find(needle) {
-        out.push_str(&rest[..idx + needle.len()]);
-        rest = &rest[idx + needle.len()..];
-        let end = rest
-            .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-            .unwrap_or(rest.len());
-        if let Some(at) = rest[..end].find('@') {
-            out.push_str("***@");
-            rest = &rest[at + 1..];
+    let mut result = s.to_owned();
+    for scheme in ["https://", "http://"] {
+        let mut start = 0;
+        while let Some(relative) = result[start..].find(scheme) {
+            let begin = start + relative + scheme.len();
+            let end = result[begin..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '/'))
+                .map(|v| begin + v)
+                .unwrap_or(result.len());
+            if let Some(at) = result[begin..end].find('@') {
+                result.replace_range(begin..begin + at, "***");
+                start = begin + 4;
+            } else {
+                start = end;
+            }
+            if start >= result.len() {
+                break;
+            }
         }
     }
-    out.push_str(rest);
-    out
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const LS_REMOTE: &str = "ref: refs/heads/main\tHEAD\n\
-        1111111111111111111111111111111111111111\tHEAD\n\
-        1111111111111111111111111111111111111111\trefs/heads/main\n\
-        2222222222222222222222222222222222222222\trefs/heads/feature/x\n\
-        3333333333333333333333333333333333333333\trefs/tags/v1\n\
-        4444444444444444444444444444444444444444\trefs/tags/v1^{}\n\
-        5555555555555555555555555555555555555555\trefs/tags/main\n";
-
-    fn oid(c: char) -> Oid {
-        Oid::from_str(&c.to_string().repeat(40)).unwrap()
-    }
-
     #[test]
-    fn parses_symref_and_peels_tags() {
-        let refs = parse_ls_remote(LS_REMOTE);
-        assert_eq!(refs.head, Some(oid('1')));
+    fn legacy_ref_contract_and_redaction() {
+        let refs = parse_ls_remote(
+            "ref: refs/heads/main\tHEAD\n1111111111111111111111111111111111111111\tHEAD\n2222222222222222222222222222222222222222\trefs/tags/v1\n3333333333333333333333333333333333333333\trefs/tags/v1^{}\n",
+        );
         assert_eq!(refs.head_ref.as_deref(), Some("refs/heads/main"));
-        assert_eq!(refs.resolve("v1"), Some(oid('4')));
-        assert_eq!(refs.resolve("feature/x"), Some(oid('2')));
-        assert_eq!(refs.resolve("refs/tags/main"), Some(oid('5')));
-        // Branch wins over a same-named tag.
-        assert_eq!(refs.resolve("main"), Some(oid('1')));
-        assert_eq!(refs.resolve("nope"), None);
-        assert_eq!(refs.short_names(), vec!["feature/x", "main", "v1"]);
-    }
-
-    #[test]
-    fn classifies_not_found() {
-        assert!(matches!(
-            classify_failure("remote: Repository not found.\nfatal: repository 'x' not found"),
-            GitError::RepoNotFound(_)
-        ));
-        assert!(matches!(
-            classify_failure("fatal: could not read Username for 'https://github.com'"),
-            GitError::RepoNotFound(_)
-        ));
-        assert!(matches!(
-            classify_failure("fatal: unable to access: Could not resolve host: github.com"),
-            GitError::Command(_)
-        ));
-        // A broken credential helper plus a network error is not "no such repo".
-        assert!(matches!(
-            classify_failure("sh: gh: not found\nfatal: unable to access: Connection reset"),
-            GitError::Command(_)
-        ));
-    }
-
-    #[test]
-    fn redacts_userinfo() {
         assert_eq!(
-            redact_creds("fatal: https://octo:tok@github.com/x.git failed"),
-            "fatal: https://***@github.com/x.git failed"
+            refs.resolve("v1"),
+            Some(Oid::from_str("3333333333333333333333333333333333333333").unwrap())
         );
         assert_eq!(
-            redact_creds("https://github.com/a/b.git and https://u:p@h/c"),
-            "https://github.com/a/b.git and https://***@h/c"
+            redact_creds("https://user:secret@github.com/a/b.git"),
+            "https://***@github.com/a/b.git"
         );
+        assert_eq!(
+            redact_creds("http://a:b@host/path https://c:d@other/repo"),
+            "http://***@host/path https://***@other/repo"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::super::transport::{Body, TransportFuture};
+    use super::*;
+    use bytes::Bytes;
+    use sha1::{Digest, Sha1};
+    use std::collections::VecDeque;
+    use std::io::{Cursor, Write};
+    use std::sync::Mutex as StdMutex;
+
+    fn pkt(data: &[u8]) -> Vec<u8> {
+        [format!("{:04x}", data.len() + 4).as_bytes(), data].concat()
+    }
+    fn framed(pack: Vec<u8>) -> Vec<u8> {
+        [
+            pkt(b"packfile\n"),
+            pkt(&[&[1u8], pack.as_slice()].concat()),
+            b"0000".to_vec(),
+        ]
+        .concat()
+    }
+    fn blob(data: &[u8]) -> (Oid, Vec<u8>) {
+        let mut oid = Sha1::new();
+        oid.update(format!("blob {}\0", data.len()));
+        oid.update(data);
+        let oid = Oid::from_bytes(&oid.finalize()).unwrap();
+        let mut raw = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        assert!(data.len() < 16);
+        raw.push(0x30 | data.len() as u8);
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(data).unwrap();
+        raw.extend(z.finish().unwrap());
+        let checksum = Sha1::digest(&raw);
+        raw.extend_from_slice(&checksum);
+        (oid, framed(raw))
+    }
+    #[derive(Debug)]
+    struct Scripted(StdMutex<VecDeque<Vec<u8>>>);
+    impl Transport for Scripted {
+        fn discover<'a>(&'a self, _: &'a str) -> TransportFuture<'a> {
+            Box::pin(async move {
+                Ok(Response {
+                    status: 200,
+                    content_type: Some("application/x-git-upload-pack-advertisement".into()),
+                    body: Box::pin(Cursor::new(
+                        [
+                            pkt(b"version 2\n"),
+                            pkt(b"ls-refs\n"),
+                            pkt(b"fetch=shallow filter\n"),
+                            b"0000".to_vec(),
+                        ]
+                        .concat(),
+                    )) as Body,
+                })
+            })
+        }
+        fn command<'a>(&'a self, _: &'a str, _: Bytes) -> TransportFuture<'a> {
+            Box::pin(async move {
+                Ok(Response {
+                    status: 200,
+                    content_type: Some("application/x-git-upload-pack-result".into()),
+                    body: Box::pin(Cursor::new(
+                        self.0
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("unexpected retry"),
+                    )),
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn oversized_batches_split_and_release_all_reservations() {
+        let (a, pack_a) = blob(b"first");
+        let (b, pack_b) = blob(b"second");
+        let transport = Arc::new(Scripted(StdMutex::new(VecDeque::from([
+            framed(vec![0; 100]),
+            pack_a,
+            pack_b,
+        ]))));
+        let mut git = GitRemote::with_transport("https://fixture", transport);
+        Arc::get_mut(&mut git.inner).unwrap().limits.max_pack_bytes = 80;
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo.git");
+        git.init_repo(&repo, "https://fixture/a/b.git")
+            .await
+            .unwrap();
+        git.fetch_blobs(&repo, &[a, b]).await.unwrap();
+        assert_eq!(git.stats().fetch_requests, 3);
+        assert_eq!(git.stats().spool_bytes, 0);
+        assert_eq!(git.stats().decode_bytes, 0);
+        assert_eq!(git.stats().available_operation_slots, 24);
+        assert_eq!(git.stats().available_decoder_slots, 2);
+        assert_eq!(
+            git2::Repository::open_bare(&repo)
+                .unwrap()
+                .find_blob(a)
+                .unwrap()
+                .content(),
+            b"first"
+        );
+        assert!(
+            std::fs::read_dir(repo.join("ghfs-staging"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn global_quota_pressure_does_not_split_or_redownload() {
+        let (a, pack_a) = blob(b"first");
+        let (b, _) = blob(b"second");
+        let transport = Arc::new(Scripted(StdMutex::new(VecDeque::from([pack_a]))));
+        let mut git = GitRemote::with_transport("https://fixture", transport);
+        Arc::get_mut(&mut git.inner).unwrap().spool_budget = Budget::new("tiny-test", 1);
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo.git");
+        git.init_repo(&repo, "https://fixture/a/b.git")
+            .await
+            .unwrap();
+        assert!(matches!(
+            git.fetch_blobs(&repo, &[a, b]).await,
+            Err(GitError::Quota(_))
+        ));
+        assert_eq!(git.stats().fetch_requests, 1);
+        assert_eq!(git.stats().spool_bytes, 0);
+    }
+    #[derive(Debug)]
+    struct ChangingIdentity {
+        generation: AtomicU64,
+        inner: Scripted,
+    }
+    impl Transport for ChangingIdentity {
+        fn identity<'a>(&'a self, _: &'a str) -> super::super::transport::IdentityFuture<'a> {
+            Box::pin(async move { self.generation.load(Ordering::Acquire) })
+        }
+        fn discover<'a>(&'a self, url: &'a str) -> TransportFuture<'a> {
+            self.inner.discover(url)
+        }
+        fn command<'a>(&'a self, url: &'a str, body: Bytes) -> TransportFuture<'a> {
+            self.inner.command(url, body)
+        }
+    }
+    #[tokio::test]
+    async fn capability_cache_is_separated_by_credential_generation() {
+        let response = [
+            pkt(b"1111111111111111111111111111111111111111 HEAD\n"),
+            b"0000".to_vec(),
+        ]
+        .concat();
+        let transport = Arc::new(ChangingIdentity {
+            generation: AtomicU64::new(0),
+            inner: Scripted(StdMutex::new(VecDeque::from([
+                response.clone(),
+                response.clone(),
+                response,
+            ]))),
+        });
+        let git = GitRemote::with_transport("https://fixture", transport.clone());
+        let url = git.url("a", "b");
+        git.ls_remote_head(&url).await.unwrap();
+        git.ls_remote_head(&url).await.unwrap();
+        assert_eq!(git.stats().discovery_requests, 1);
+        transport.generation.store(1, Ordering::Release);
+        git.ls_remote_head(&url).await.unwrap();
+        assert_eq!(git.stats().discovery_requests, 2);
     }
 }
