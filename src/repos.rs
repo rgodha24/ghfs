@@ -37,13 +37,8 @@ const NOT_FOUND_TTL: Duration = Duration::from_secs(600);
 const DIR_BATCH_MAX: usize = 1000;
 /// Most directories a single subtree prefetch covers.
 const PREFETCH_MAX_TREES: usize = 256;
-/// Blobs up to this size are written to the file cache straight from libgit2;
-/// bigger ones are streamed from loose zlib objects with bounded buffers.
 const STREAM_BLOB_OVER: u64 = 8 << 20;
 const MAX_GLOBAL_READS: usize = 16;
-/// Most libgit2 handles (each holding pack files open) per repo. Blocking
-/// reads beyond this wait for a free handle instead of opening more, which
-/// would run out of file descriptors (macOS defaults to 256).
 const MAX_REPO_HANDLES: usize = 8;
 /// Background directory prefetches running at once. Requests that actually
 /// wait on a directory don't take a slot, so they never queue behind these.
