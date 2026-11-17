@@ -2,19 +2,19 @@
 //!
 //! ```text
 //! <cache>/ghfs/
-//! └── v2/
-//!     ├── repos/<owner>/<repo>.git   # shallow, blobless bare repo per GitHub repo
+//! └── v3/
+//!     ├── repos/<owner>/<repo>.git   # bare loose-object store per GitHub repo
 //!     └── blobs/<xx>/<oid>           # blob contents materialized for reads
 //! ```
 //!
-//! Directories older versions created next to `v2/` (`mirrors/`, `worktrees/`,
+//! Directories older versions created next to `v3/` (`mirrors/`, `worktrees/`,
 //! ...) are deleted on daemon startup (see [`CachePaths::remove_legacy`]).
 
 use std::path::{Path, PathBuf};
 
 use crate::types::RepoKey;
 
-const LAYOUT_DIR: &str = "v2";
+const LAYOUT_DIR: &str = "v3";
 
 /// Everything pre-v2 ghfs versions created directly under the base dir.
 const LEGACY_ENTRIES: &[&str] = &[
@@ -34,7 +34,7 @@ pub struct CachePaths {
 }
 
 impl CachePaths {
-    /// `base` is the `ghfs` cache directory (the parent of `v2/`).
+    /// `base` is the `ghfs` cache directory (the parent of `v3/`).
     pub fn new(base: impl Into<PathBuf>) -> Self {
         Self { base: base.into() }
     }
@@ -78,6 +78,20 @@ impl CachePaths {
     pub fn create_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.repos_dir())?;
         std::fs::create_dir_all(self.blobs_dir())
+    }
+
+    /// Run before admitting transfers so no current worker can lose its staging.
+    /// v2 is deliberately retained and is never opened by the v3 remote layer.
+    pub fn remove_abandoned_staging(&self) -> std::io::Result<()> {
+        for key in self.cached_repos() {
+            let staging = self.repo_dir(&key).join("ghfs-staging");
+            match std::fs::remove_dir_all(&staging) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Delete what older ghfs versions left in the base dir. Only these exact
@@ -155,6 +169,24 @@ mod tests {
         assert!(paths.repos_dir().exists());
         assert!(tmp.path().join("someone-elses-cache").exists());
         assert!(tmp.path().join("notes.txt").exists());
+    }
+
+    #[test]
+    fn startup_removes_only_v3_abandoned_transfers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CachePaths::new(tmp.path());
+        let repo = paths.repo_dir(&"octo/hello".parse().unwrap());
+        std::fs::create_dir_all(repo.join("ghfs-staging/old")).unwrap();
+        std::fs::write(repo.join("ghfs-staging/old/transfer.pack"), b"partial").unwrap();
+        std::fs::create_dir_all(tmp.path().join("v2/repos/old")).unwrap();
+        std::fs::write(tmp.path().join("v2/keep"), b"old cache").unwrap();
+        paths.remove_abandoned_staging().unwrap();
+        assert!(!repo.join("ghfs-staging").exists());
+        paths.remove_legacy();
+        assert_eq!(
+            std::fs::read(tmp.path().join("v2/keep")).unwrap(),
+            b"old cache"
+        );
     }
 
     #[test]

@@ -197,7 +197,7 @@ async fn cached_head_survives_restart_and_offline() {
         vfs.read(file, 0, 100).await.unwrap();
     }
     // New daemon, remote gone: everything already fetched still works.
-    let offline = ghfs::git::GitCli::with_base_url("file:///nonexistent");
+    let offline = ghfs::git::GitRemote::with_base_url("file:///nonexistent");
     let repos = ghfs::repos::Repos::new(paths, offline);
     let vfs = ghfs::vfs::Vfs::new(repos);
     let owner = vfs.lookup(ghfs::vfs::ROOT_INO, b"octo").await.unwrap();
@@ -225,7 +225,7 @@ async fn directory_blobs_are_fetched_in_one_batch() {
     let env = Arc::new(Env::new(remote));
 
     env.ls("octo/wide/many").await;
-    let packs_after_listing = env.pack_count("octo", "wide");
+    let fetches_after_listing = env.fetch_count();
     // Read every file concurrently.
     let mut tasks = Vec::new();
     for i in 0..200 {
@@ -238,10 +238,10 @@ async fn directory_blobs_are_fetched_in_one_batch() {
     for t in tasks {
         t.await.unwrap();
     }
-    let packs = env.pack_count("octo", "wide");
+    let fetches = env.fetch_count();
     assert!(
-        packs <= packs_after_listing + 1,
-        "200 files should arrive in one batch, got {packs} packs (was {packs_after_listing})"
+        fetches <= fetches_after_listing + 1,
+        "200 files should arrive in one batch, got {fetches} requests (was {fetches_after_listing})"
     );
 }
 
@@ -261,11 +261,11 @@ async fn concurrent_first_access_shares_one_fetch() {
         assert_eq!(t.await.unwrap(), b"pub fn lib() {}\n");
     }
     // One commit fetch + one blob batch for src/.
-    assert!(env.pack_count("octo", "hello") <= 2);
+    assert!(env.fetch_count() <= 2);
 }
 
 #[tokio::test]
-async fn repack_consolidates_packs() {
+async fn repeated_fetches_retain_only_loose_objects() {
     let remote = Remote::new();
     let fx = sample(&remote);
     let env = Env::new(remote);
@@ -278,11 +278,11 @@ async fn repack_consolidates_packs() {
             format!("v{i}\n").into_bytes()
         );
     }
-    assert!(env.pack_count("octo", "hello") > 5);
+    assert!(env.fetch_count() > 5);
     let key = "octo/hello".parse().unwrap();
-    env.repos.get(&key).repack().await;
-    assert_eq!(env.pack_count("octo", "hello"), 1);
-    // Everything still readable after the repack.
+    assert!(env.repos.get(&key).dir().join("ghfs-complete").is_dir());
+    env.assert_loose_only();
+    // Historical fetches and later reads require no consolidation.
     for dir in ["", "src", "src/nested"] {
         env.ls(&format!("octo/hello/{dir}")).await;
     }
@@ -304,14 +304,14 @@ async fn listing_prefetches_the_subtree() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let packs = env.pack_count("octo", "hello");
+    let fetches = env.fetch_count();
     // Deep files were fetched by the root listing's prefetch: no new fetches.
     assert_eq!(env.cat("octo/hello/src/nested/deep.txt").await, b"deep\n");
     assert_eq!(
         env.cat("octo/hello/bin/run.sh").await,
         b"#!/bin/sh\necho hi\n"
     );
-    assert_eq!(env.pack_count("octo", "hello"), packs);
+    assert_eq!(env.fetch_count(), fetches);
 }
 
 /// Regression: parallel shallow fetches in one repo collided on git's
@@ -372,7 +372,7 @@ async fn concurrent_reads_share_one_blob_file() {
         let end = (start + data.len()).min(big.len());
         assert_eq!(data, &big[start..end]);
     }
-    let blobs = env.cache.path().join("v2/blobs");
+    let blobs = env.cache.path().join("v3/blobs");
     let files: Vec<_> = walk_files(&blobs);
     assert_eq!(
         files.len(),
@@ -418,9 +418,9 @@ async fn huge_directory() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let packs = env.pack_count("octo", "huge");
+    let fetches = env.fetch_count();
     assert_eq!(env.cat("octo/huge/huge/f0007").await, b"7\n");
-    assert_eq!(env.pack_count("octo", "huge"), packs, "already prefetched");
+    assert_eq!(env.fetch_count(), fetches, "already prefetched");
 }
 
 /// Regression: on macOS the kernel can keep using cached names and only send
@@ -495,9 +495,199 @@ async fn truncated_cached_blob_is_rewritten() {
         vfs.read(file, 0, 100).await.unwrap().0
     };
     assert_eq!(read_readme(paths.clone(), remote.cli()).await, b"# hello\n");
-    for f in walk_files(&cache.path().join("v2/blobs")) {
+    for f in walk_files(&cache.path().join("v3/blobs")) {
         std::fs::write(f, b"").unwrap();
     }
     // A new run (fresh verification state) must not serve the empty file.
     assert_eq!(read_readme(paths, remote.cli()).await, b"# hello\n");
+}
+
+/// A persisted marker is advisory until the whole tree closure has been hashed
+/// this run. Missing/corrupt descendants must be repaired, not hidden by HEAD.
+#[tokio::test]
+async fn restart_repairs_missing_and_corrupt_trees_beneath_a_completion_marker() {
+    let remote = Remote::new();
+    let fx = sample(&remote);
+    let commit: git2::Oid = common::git(&fx.work, &["rev-parse", "HEAD"])
+        .parse()
+        .unwrap();
+    let child: git2::Oid = common::git(&fx.work, &["rev-parse", "HEAD:src/nested"])
+        .parse()
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let paths = ghfs::paths::CachePaths::new(cache.path());
+    let key = "octo/hello".parse().unwrap();
+    let object = paths
+        .repo_dir(&key)
+        .join("objects")
+        .join(&child.to_string()[..2])
+        .join(&child.to_string()[2..]);
+    let marker = paths
+        .repo_dir(&key)
+        .join("ghfs-complete")
+        .join(commit.to_string());
+    {
+        let repos = ghfs::repos::Repos::new(paths.clone(), remote.cli());
+        repos.get(&key).ensure_commit(commit).await.unwrap();
+        assert!(marker.is_file());
+        repos.shutdown().await;
+    }
+    for corrupt in [false, true] {
+        if corrupt {
+            std::fs::write(&object, b"corrupt zlib bytes").unwrap();
+        } else {
+            std::fs::remove_file(&object).unwrap();
+        }
+        let git = remote.cli();
+        let repos = ghfs::repos::Repos::new(paths.clone(), git.clone());
+        let handle = repos.get(&key);
+        handle.ensure_commit(commit).await.unwrap();
+        assert_eq!(
+            git.stats().fetch_requests,
+            1,
+            "restart must refetch the incomplete closure"
+        );
+        handle.tree(child).await.unwrap();
+        assert!(marker.is_file());
+        handle.ensure_commit(commit).await.unwrap();
+        assert_eq!(
+            git.stats().fetch_requests,
+            1,
+            "validated markers are cached this run"
+        );
+        repos.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn annotated_tag_object_ids_are_peeled_without_fetching_history() {
+    let remote = Remote::new();
+    let fx = sample(&remote);
+    common::git(&fx.work, &["tag", "-a", "annotated", "-m", "annotated"]);
+    fx.push("annotated");
+    let tag = common::git(&fx.work, &["rev-parse", "annotated"]);
+    let env = Env::new(remote);
+    assert_eq!(
+        env.cat(&format!("by-ref/octo/hello/{tag}/README.md")).await,
+        b"# hello\n"
+    );
+    env.assert_loose_only();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_large_materialization_can_be_retried_without_temp_races() {
+    use std::io::Write;
+    let remote = Remote::new();
+    let fx = sample(&remote);
+    let mut file = std::fs::File::create(fx.work.join("big.bin")).unwrap();
+    let chunk = vec![b'x'; 1 << 20];
+    for _ in 0..64 {
+        file.write_all(&chunk).unwrap();
+    }
+    drop(file);
+    let commit: git2::Oid = fx.commit("large streaming file").parse().unwrap();
+    fx.push("main");
+    let blob: git2::Oid = common::git(&fx.work, &["rev-parse", "HEAD:big.bin"])
+        .parse()
+        .unwrap();
+    let env = Env::new(remote);
+    let handle = env.repos.get(&"octo/hello".parse().unwrap());
+    let (tree, _) = handle.ensure_commit(commit).await.unwrap();
+    assert_eq!(handle.blob_size(tree, blob).await.unwrap(), 64 << 20);
+    let writer = handle.clone();
+    let task = tokio::spawn(async move { writer.materialize(tree, blob).await });
+    let directory = env.repos.paths().blobs_dir().join(&blob.to_string()[..2]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let writing = std::fs::read_dir(&directory).ok().is_some_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+        });
+        if writing || task.is_finished() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "writer never started");
+        tokio::task::yield_now().await;
+    }
+    task.abort();
+    let _ = task.await;
+    let path = handle.materialize(tree, blob).await.unwrap();
+    use std::io::Read;
+    let mut input = std::fs::File::open(path).unwrap();
+    let mut buffer = [0; 65536];
+    let mut bytes = 0;
+    loop {
+        let n = input.read(&mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        assert!(buffer[..n].iter().all(|byte| *byte == b'x'));
+        bytes += n;
+    }
+    assert_eq!(bytes, 64 << 20);
+    env.repos.shutdown().await;
+    assert_eq!(env.git.stats().available_operation_slots, 24);
+    assert_eq!(env.git.stats().available_decoder_slots, 2);
+    assert!(
+        std::fs::read_dir(directory)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+    );
+    env.assert_loose_only();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_loose_blobs_are_dropped_and_refetched() {
+    use std::io::Write;
+    let remote = Remote::new();
+    let fx = sample(&remote);
+    let mut file = std::fs::File::create(fx.work.join("big.bin")).unwrap();
+    for i in 0..10u8 {
+        file.write_all(&vec![b'a' + i; 1 << 20]).unwrap();
+    }
+    drop(file);
+    let commit: git2::Oid = fx.commit("large file").parse().unwrap();
+    fx.push("main");
+    let big = std::fs::read(fx.work.join("big.bin")).unwrap();
+    let cases: [(&str, &[u8]); 2] = [("README.md", b"# hello\n"), ("big.bin", &big)];
+    let cache = tempfile::tempdir().unwrap();
+    let paths = ghfs::paths::CachePaths::new(cache.path());
+    let key = "octo/hello".parse().unwrap();
+    for truncate in [true, false] {
+        for (name, expected) in cases {
+            let blob: git2::Oid = common::git(&fx.work, &["rev-parse", &format!("HEAD:{name}")])
+                .parse()
+                .unwrap();
+            let hex = blob.to_string();
+            let object = paths
+                .repo_dir(&key)
+                .join("objects")
+                .join(&hex[..2])
+                .join(&hex[2..]);
+            let repos = ghfs::repos::Repos::new(paths.clone(), remote.cli());
+            let handle = repos.get(&key);
+            let (tree, _) = handle.ensure_commit(commit).await.unwrap();
+            handle.blob_size(tree, blob).await.unwrap();
+            let loose = std::fs::read(&object).unwrap();
+            // Simulate an unsynced write lost to a crash: the object still
+            // "exists" but cannot be inflated or fails hash verification.
+            let damaged = if truncate {
+                loose[..loose.len() / 2].to_vec()
+            } else {
+                b"not a zlib stream".to_vec()
+            };
+            std::fs::write(&object, damaged).unwrap();
+            let _ = std::fs::remove_file(repos.paths().blob_path(&hex));
+            let path = handle.materialize(tree, blob).await.unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                expected,
+                "{name}, truncate={truncate}"
+            );
+            assert_eq!(std::fs::read(&object).unwrap(), loose);
+            repos.shutdown().await;
+        }
+    }
 }

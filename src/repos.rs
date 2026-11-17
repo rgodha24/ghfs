@@ -11,15 +11,17 @@
 //! - Concurrent requests for the same commit/directory share one fetch.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
 use git2::{Oid, Repository};
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
-use crate::git::{GitCli, GitError, RemoteRefs, TreeEntry, odb};
+use crate::git::{GitError, GitRemote, RemoteRefs, TreeEntry, odb};
 use crate::paths::CachePaths;
 use crate::singleflight::SingleFlight;
 use crate::types::RepoKey;
@@ -33,14 +35,12 @@ const NOT_FOUND_TTL: Duration = Duration::from_secs(600);
 /// Directories with more missing blobs than this are fetched per file on
 /// demand (and in chunks of this size when prefetching).
 const DIR_BATCH_MAX: usize = 1000;
-/// Repack once a repo has accumulated this many packs.
-const REPACK_THRESHOLD: usize = 50;
 /// Most directories a single subtree prefetch covers.
 const PREFETCH_MAX_TREES: usize = 256;
 /// Blobs up to this size are written to the file cache straight from libgit2;
-/// bigger ones are streamed through `git cat-file` so they're never fully in
-/// memory.
+/// bigger ones are streamed from loose zlib objects with bounded buffers.
 const STREAM_BLOB_OVER: u64 = 8 << 20;
+const MAX_GLOBAL_READS: usize = 16;
 /// Most libgit2 handles (each holding pack files open) per repo. Blocking
 /// reads beyond this wait for a free handle instead of opening more, which
 /// would run out of file descriptors (macOS defaults to 256).
@@ -89,21 +89,25 @@ struct Cached<T> {
 /// All repos known to this daemon.
 pub struct Repos {
     paths: CachePaths,
-    git: GitCli,
+    git: GitRemote,
     repos: DashMap<RepoKey, Arc<RepoHandle>>,
     not_found: DashMap<RepoKey, Instant>,
     started: SystemTime,
     prefetch_slots: Arc<tokio::sync::Semaphore>,
+    read_slots: Arc<tokio::sync::Semaphore>,
+    materialize_slots: Arc<tokio::sync::Semaphore>,
     /// Directory prefetches spawned and not yet finished.
     prefetches: Arc<std::sync::atomic::AtomicUsize>,
     head_ttl_ms: AtomicU64,
 }
 
 impl Repos {
-    pub fn new(paths: CachePaths, git: GitCli) -> Arc<Self> {
+    pub fn new(paths: CachePaths, git: GitRemote) -> Arc<Self> {
         Arc::new(Self {
             paths,
             git,
+            read_slots: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_READS)),
+            materialize_slots: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_READS)),
             repos: DashMap::new(),
             not_found: DashMap::new(),
             started: SystemTime::now(),
@@ -121,6 +125,10 @@ impl Repos {
 
     fn head_ttl(&self) -> Duration {
         Duration::from_millis(self.head_ttl_ms.load(Ordering::Relaxed))
+    }
+
+    pub async fn shutdown(&self) {
+        self.git.shutdown().await;
     }
 
     pub fn paths(&self) -> &CachePaths {
@@ -143,7 +151,6 @@ impl Repos {
                     repos: Arc::downgrade(self),
                     init: tokio::sync::OnceCell::new(),
                     pool: Mutex::new(Vec::new()),
-                    pool_generation: AtomicU64::new(0),
                     pool_slots: Arc::new(tokio::sync::Semaphore::new(MAX_REPO_HANDLES)),
                     head: Mutex::new(None),
                     refs: Mutex::new(None),
@@ -154,9 +161,9 @@ impl Repos {
                     bulk_flight: SingleFlight::default(),
                     materialize_flight: SingleFlight::default(),
                     verified: Mutex::new(std::collections::HashSet::new()),
-                    commit_fetch: tokio::sync::Mutex::new(()),
+                    validated_commits: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
+                    read_slots: self.read_slots.clone(),
                     prefetched: Mutex::new(std::collections::HashSet::new()),
-                    repacking: AtomicBool::new(false),
                     changed_at: Mutex::new(self.started),
                 })
             })
@@ -211,9 +218,6 @@ impl Repos {
             if blobs > 0 {
                 out.push(format!("{}: fetching {blobs} blob batch(es)", handle.key));
             }
-            if handle.repacking.load(Ordering::Relaxed) {
-                out.push(format!("{}: repacking", handle.key));
-            }
         }
         out.sort();
         out
@@ -224,21 +228,19 @@ pub struct RepoHandle {
     pub key: RepoKey,
     dir: PathBuf,
     url: String,
-    git: GitCli,
+    git: GitRemote,
     repos: std::sync::Weak<Repos>,
     init: tokio::sync::OnceCell<()>,
     /// Checked-out libgit2 handles for blocking reads. `Repository` isn't
     /// `Sync`, so each blocking task borrows its own.
     pool: Mutex<Vec<Repository>>,
-    /// Bumped after a repack so handles with stale pack lists get dropped.
-    pool_generation: AtomicU64,
     /// Caps concurrent blocking reads (and so open handles) per repo.
     pool_slots: Arc<tokio::sync::Semaphore>,
     head: Mutex<Option<Cached<RemoteRefs>>>,
     refs: Mutex<Option<Cached<Arc<RemoteRefs>>>>,
     head_flight: SingleFlight<(), Result<RemoteRefs>>,
     refs_flight: SingleFlight<(), Result<Arc<RemoteRefs>>>,
-    commit_flight: SingleFlight<Oid, Result<()>>,
+    commit_flight: SingleFlight<Oid, Result<(Oid, i64)>>,
     /// Keyed by directory tree oid (batch) or blob oid (single). Every fetch
     /// under these keys is at most one batch, so a request that joins one
     /// waits for at most one round trip.
@@ -251,13 +253,12 @@ pub struct RepoHandle {
     materialize_flight: SingleFlight<Oid, Result<PathBuf>>,
     /// Cached blob files whose length was checked against the object this run.
     verified: Mutex<std::collections::HashSet<Oid>>,
-    /// Shallow fetches take `shallow.lock`, and git fails instead of waiting
-    /// when it's held, so commit fetches in one repo run one at a time.
-    commit_fetch: tokio::sync::Mutex<()>,
+    /// A marker's complete tree closure is validated once per run, with a bounded cache.
+    validated_commits: Mutex<LruCache<Oid, (Oid, i64)>>,
+    read_slots: Arc<tokio::sync::Semaphore>,
     /// Trees whose subtree prefetch is scheduled or done (FUSE and NFS list
     /// a directory in pages; only the first page should start one).
     prefetched: Mutex<std::collections::HashSet<Oid>>,
-    repacking: AtomicBool,
     /// When HEAD or the ref listing last changed. Used as the directory mtime
     /// of `<owner>/<repo>` and `by-ref/<owner>/<repo>` so kernels revalidate
     /// cached names after a branch moves.
@@ -292,6 +293,12 @@ impl RepoHandle {
         T: Send + 'static,
         F: Fn(&Repository) -> std::result::Result<T, GitError> + Send + 'static,
     {
+        let global = self
+            .read_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("read semaphore never closed");
         let slot = self
             .pool_slots
             .clone()
@@ -301,6 +308,7 @@ impl RepoHandle {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
+            let _global = global;
             this.with_repo_blocking(f)
         })
         .await
@@ -311,27 +319,15 @@ impl RepoHandle {
         &self,
         f: impl Fn(&Repository) -> std::result::Result<T, GitError>,
     ) -> Result<T> {
-        for attempt in 0..2 {
-            let generation = self.pool_generation.load(Ordering::Acquire);
-            let repo = match self.pool.lock().expect("repo pool poisoned").pop() {
-                Some(repo) => repo,
-                None => odb::open(&self.dir)?,
-            };
-            let result = f(&repo);
-            let transient = matches!(result, Err(GitError::Libgit2(_)));
-            if !transient && self.pool_generation.load(Ordering::Acquire) == generation {
-                self.pool.lock().expect("repo pool poisoned").push(repo);
-            }
-            match result {
-                // A pack may have been swapped out by a repack under us; retry
-                // once with a fresh handle.
-                Err(GitError::Libgit2(e)) if attempt == 0 => {
-                    log::debug!("{}: retrying libgit2 read after: {e}", self.key);
-                }
-                other => return other.map_err(Into::into),
-            }
+        let repo = match self.pool.lock().expect("repo pool poisoned").pop() {
+            Some(repo) => repo,
+            None => odb::open(&self.dir)?,
+        };
+        let result = f(&repo);
+        if !matches!(result, Err(GitError::Libgit2(_))) {
+            self.pool.lock().expect("repo pool poisoned").push(repo);
         }
-        unreachable!("loop returns on second attempt")
+        result.map_err(Into::into)
     }
 
     fn cached_head(&self) -> Option<Cached<RemoteRefs>> {
@@ -428,7 +424,7 @@ impl RepoHandle {
                         }
                         // Keep serving the cached HEAD and wait a full TTL
                         // before retrying, so being offline doesn't turn every
-                        // lookup into a failing `git ls-remote`.
+                        // lookup into a failing remote request.
                         if let Some(cached) = this.head.lock().expect("head poisoned").as_mut() {
                             cached.at = Instant::now();
                         }
@@ -530,19 +526,7 @@ impl RepoHandle {
                 if self.dir.join("objects").exists() {
                     return Ok(());
                 }
-                // Init into a temp dir and rename, so a crash never leaves a
-                // half-configured repo in place.
-                let tmp = self.dir.with_extension("init.tmp");
-                let _ = tokio::fs::remove_dir_all(&tmp).await;
-                if let Some(parent) = self.dir.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| RepoError::Failed(e.to_string()))?;
-                }
-                self.git.init_repo(&tmp, &self.url).await?;
-                tokio::fs::rename(&tmp, &self.dir)
-                    .await
-                    .map_err(|e| RepoError::Failed(e.to_string()))?;
+                self.git.init_repo(&self.dir, &self.url).await?;
                 if let Some(cached) = self.head.lock().expect("head poisoned").clone() {
                     self.persist_head(&cached.value);
                 }
@@ -552,45 +536,58 @@ impl RepoHandle {
             .map(|_| ())
     }
 
-    /// Make sure `commit` and its trees are local. Returns `(root tree, commit time)`.
+    /// Make sure the commit's complete tree closure is local (without history/blobs).
     pub async fn ensure_commit(self: &Arc<Self>, commit: Oid) -> Result<(Oid, i64)> {
         self.ensure_init().await?;
-        if let Ok(info) = self.with_repo(move |r| odb::commit_info(r, commit)).await {
+        if let Some(info) = self
+            .validated_commits
+            .lock()
+            .expect("commits poisoned")
+            .get(&commit)
+            .copied()
+        {
             return Ok(info);
         }
         let this = self.clone();
         self.commit_flight
             .run(commit, || async move {
-                let _one_at_a_time = this.commit_fetch.lock().await;
-                // Nothing else fetches commits into this repo right now, so a
-                // lock left by a killed fetch is stale; git would refuse to
-                // shallow-fetch until it's gone.
-                let lock = this.dir.join("shallow.lock");
-                if tokio::fs::try_exists(&lock).await.unwrap_or(false) {
-                    log::warn!("{}: removing stale shallow.lock", this.key);
-                    let _ = tokio::fs::remove_file(&lock).await;
+                let marker = this.dir.join("ghfs-complete").join(commit.to_string());
+                if marker.is_file() {
+                    match this.git.validate_commit(&this.dir, commit).await {
+                        Ok(info) => {
+                            this.validated_commits
+                                .lock()
+                                .expect("commits poisoned")
+                                .put(commit, info);
+                            return Ok(info);
+                        }
+                        Err(GitError::Cancelled | GitError::Timeout(_) | GitError::Quota(_)) => {
+                            return Err(RepoError::Failed("commit validation interrupted".into()));
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "{}: incomplete/corrupt commit {commit}: {error}; refetching",
+                                this.key
+                            );
+                            let _ = tokio::fs::remove_file(&marker).await;
+                        }
+                    }
                 }
                 let started = Instant::now();
                 this.git.fetch_commit(&this.dir, commit).await?;
+                let info = this.with_repo(move |r| odb::commit_info(r, commit)).await?;
+                this.validated_commits
+                    .lock()
+                    .expect("commits poisoned")
+                    .put(commit, info);
                 log::info!(
                     "{}: fetched commit {commit} in {:?}",
                     this.key,
                     started.elapsed()
                 );
-                this.pin(commit);
-                this.maybe_repack();
-                Ok(())
+                Ok(info)
             })
-            .await?;
-        self.with_repo(move |r| odb::commit_info(r, commit)).await
-    }
-
-    /// Keep fetched commits reachable so a repack never drops them.
-    fn pin(&self, commit: Oid) {
-        let dir = self.dir.join("refs/ghfs");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join(commit.to_string()), format!("{commit}\n"));
-        }
+            .await
     }
 
     pub async fn tree(self: &Arc<Self>, tree: Oid) -> Result<Vec<TreeEntry>> {
@@ -627,6 +624,7 @@ impl RepoHandle {
             return Err(RepoError::Failed("shutting down".into()));
         };
         let path = repos.paths.blob_path(&blob.to_string());
+        let materialize_slots = repos.materialize_slots.clone();
         if self
             .verified
             .lock()
@@ -657,25 +655,56 @@ impl RepoHandle {
                     );
                     let _ = tokio::fs::remove_file(&path).await;
                 }
+                let slot = materialize_slots
+                    .acquire_owned()
+                    .await
+                    .expect("materialize semaphore never closed");
                 let dir = path.parent().expect("blob path has a parent").to_path_buf();
                 tokio::fs::create_dir_all(&dir)
                     .await
                     .map_err(|e| RepoError::Failed(format!("create {}: {e}", dir.display())))?;
-                let tmp = dir.join(format!(".{blob}.{}.tmp", std::process::id()));
+                let temp = tempfile::Builder::new()
+                    .prefix(&format!(".{blob}."))
+                    .tempfile_in(&dir)
+                    .map_err(|e| RepoError::Failed(e.to_string()))?;
+                let (file, temp_path) = temp.into_parts();
+                let tmp = temp_path.to_path_buf();
                 let result = async {
-                    let file = std::fs::File::create(&tmp)
-                        .map_err(|e| RepoError::Failed(format!("create {}: {e}", tmp.display())))?;
                     if size > STREAM_BLOB_OVER {
+                        let _slot = slot;
                         let out = file
                             .try_clone()
                             .map_err(|e| RepoError::Failed(e.to_string()))?;
-                        this.git.cat_blob_to_file(&this.dir, blob, out).await?;
+                        match this.git.cat_blob_to_file(&this.dir, blob, out).await {
+                            // The local object was corrupt and has been dropped:
+                            // refetch it and copy again from the start.
+                            Err(GitError::MissingObject(_)) => {
+                                this.fetch_blob(dir_tree, blob).await?;
+                                let out = file
+                                    .try_clone()
+                                    .map_err(|e| RepoError::Failed(e.to_string()))?;
+                                let out = tokio::task::spawn_blocking(move || {
+                                    use std::io::Seek;
+                                    let mut out = out;
+                                    out.set_len(0)?;
+                                    out.seek(std::io::SeekFrom::Start(0))?;
+                                    Ok::<_, std::io::Error>(out)
+                                })
+                                .await
+                                .map_err(|e| RepoError::Failed(e.to_string()))?
+                                .map_err(|e| RepoError::Failed(format!("reset blob: {e}")))?;
+                                this.git.cat_blob_to_file(&this.dir, blob, out).await?;
+                            }
+                            other => other?,
+                        }
                     } else {
-                        let data = this.with_repo(move |r| odb::read_blob(r, blob)).await?;
+                        // Refetches if the local object was missing or corrupt.
+                        let data = this.read_blob(dir_tree, blob).await?;
                         let mut out = file
                             .try_clone()
                             .map_err(|e| RepoError::Failed(e.to_string()))?;
                         tokio::task::spawn_blocking(move || {
+                            let _slot = slot;
                             std::io::Write::write_all(&mut out, &data)
                         })
                         .await
@@ -692,6 +721,7 @@ impl RepoHandle {
                     .map_err(|e| RepoError::Failed(e.to_string()))?
                 }
                 .await;
+                let _owned_temp = temp_path;
                 match result {
                     Ok(written) if written == size => {
                         tokio::fs::rename(&tmp, &path)
@@ -719,7 +749,9 @@ impl RepoHandle {
     }
 
     async fn fetch_blob(self: &Arc<Self>, dir_tree: Oid, blob: Oid) -> Result<()> {
-        self.fetch_dir_blobs(dir_tree).await?;
+        // A failed directory batch (e.g. one oversized sibling) may still have
+        // fetched this blob; otherwise fall through to fetching it alone.
+        let batch = self.fetch_dir_blobs(dir_tree).await;
         let present = self
             .with_repo(move |r| odb::missing_objects(r, &[blob]))
             .await?
@@ -727,12 +759,17 @@ impl RepoHandle {
         if present {
             return Ok(());
         }
-        // Directory too big to batch (or the batch raced a repack): fetch just this one.
+        if let Err(error) = &batch {
+            log::debug!(
+                "{}: directory {dir_tree} batch failed ({error}); fetching blob {blob} alone",
+                self.key
+            );
+        }
+        // Directory too big to batch, or its batch failed: fetch just this one.
         let this = self.clone();
         self.blob_flight
             .run(blob, || async move {
                 this.git.fetch_blobs(&this.dir, &[blob]).await?;
-                this.maybe_repack();
                 Ok(true)
             })
             .await
@@ -774,7 +811,6 @@ impl RepoHandle {
                     missing.len(),
                     started.elapsed()
                 );
-                this.maybe_repack();
                 Ok(true)
             })
             .await
@@ -789,7 +825,6 @@ impl RepoHandle {
                 let started = Instant::now();
                 for chunk in missing.chunks(DIR_BATCH_MAX) {
                     this.git.fetch_blobs(&this.dir, chunk).await?;
-                    this.maybe_repack();
                 }
                 log::info!(
                     "{}: fetched {} blobs of big tree {tree} in {:?}",
@@ -905,42 +940,10 @@ impl RepoHandle {
                     dirs,
                     started.elapsed()
                 );
-                this.maybe_repack();
                 Ok(true)
             })
             .await
             .map(|_| ())
-    }
-
-    pub fn maybe_repack(self: &Arc<Self>) {
-        if odb::pack_count(&self.dir) < REPACK_THRESHOLD {
-            return;
-        }
-        let this = self.clone();
-        tokio::spawn(async move {
-            this.repack().await;
-        });
-    }
-
-    /// Consolidate packs. Safe alongside concurrent fetches: git only deletes
-    /// the packs it rolled up.
-    pub async fn repack(self: &Arc<Self>) {
-        if self.repacking.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let started = Instant::now();
-        let before = odb::pack_count(&self.dir);
-        match self.git.repack(&self.dir).await {
-            Ok(()) => log::info!(
-                "{}: repacked {before} packs in {:?}",
-                self.key,
-                started.elapsed()
-            ),
-            Err(e) => log::warn!("{}: repack failed: {e}", self.key),
-        }
-        self.pool_generation.fetch_add(1, Ordering::AcqRel);
-        self.pool.lock().expect("repo pool poisoned").clear();
-        self.repacking.store(false, Ordering::Release);
     }
 }
 
@@ -963,7 +966,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repos = Repos::new(
             CachePaths::new(tmp.path()),
-            GitCli::with_base_url("file:///x"),
+            GitRemote::with_base_url("file:///x"),
         );
         let key: RepoKey = "octo/gone".parse().unwrap();
         repos
@@ -990,7 +993,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repos = Repos::new(
             CachePaths::new(tmp.path()),
-            GitCli::with_base_url("file:///x"),
+            GitRemote::with_base_url("file:///x"),
         );
         let a = repos.get(&"Octo/Hello".parse().unwrap());
         let b = repos.get(&"octo/hello".parse().unwrap());

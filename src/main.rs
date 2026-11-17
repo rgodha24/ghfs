@@ -52,7 +52,7 @@ enum Commands {
         repo: String,
     },
 
-    /// Repack cached repos and drop old cached file contents
+    /// Drop cached file contents unused for a week
     Gc,
 
     /// Check dependencies
@@ -167,7 +167,6 @@ fn cmd_gc() -> Result<(), Box<dyn std::error::Error>> {
     let result = client.gc()?;
 
     println!("Garbage collection complete");
-    println!("  Repositories repacked: {}", result.repos_repacked);
     println!("  Cached blobs removed:  {}", result.blobs_removed);
     println!(
         "  Space freed:           {:.1} MiB",
@@ -179,18 +178,6 @@ fn cmd_gc() -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     println!("GHFS System Check\n");
-
-    // Check git
-    let git_ok = std::process::Command::new("git")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    println!(
-        "[{}] git: {}",
-        if git_ok { "OK" } else { "FAIL" },
-        if git_ok { "available" } else { "not found" }
-    );
 
     #[cfg(target_os = "linux")]
     let (backend_ok, backend_label, backend_detail) = {
@@ -284,7 +271,7 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
         mount_point.display()
     );
 
-    if !git_ok || !backend_ok {
+    if !backend_ok {
         std::process::exit(1);
     }
 

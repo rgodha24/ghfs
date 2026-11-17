@@ -1,10 +1,12 @@
-//! Local object reads through libgit2. Everything here is blocking but only
+//! Local object reads (trees and commits through libgit2, blobs through our
+//! bounded loose reader). Everything here is blocking but only
 //! touches the local object database, never the network; callers run it on
 //! tokio's blocking pool.
 
-use git2::{ErrorCode, ObjectType, Oid, Repository};
+use git2::{ErrorCode, Oid, Repository};
 
 use super::GitError;
+use super::loose::{self, Kind};
 
 /// Kind of a git tree entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,16 +53,6 @@ fn missing(e: git2::Error, oid: Oid) -> GitError {
 }
 
 pub fn open(dir: &std::path::Path) -> Result<Repository, GitError> {
-    static EXTENSIONS: std::sync::Once = std::sync::Once::new();
-    EXTENSIONS.call_once(|| {
-        // Our repos are partial clones; libgit2 refuses unknown repository
-        // extensions unless told they're fine. It only reads local objects,
-        // which is all partialclone changes the meaning of.
-        // SAFETY: called once, before any repository is opened.
-        if let Err(e) = unsafe { git2::opts::set_extensions(&["partialclone"]) } {
-            log::warn!("failed to register partialclone extension: {e}");
-        }
-    });
     Ok(Repository::open_bare(dir)?)
 }
 
@@ -97,15 +89,18 @@ pub fn read_tree(repo: &Repository, tree: Oid) -> Result<Vec<TreeEntry>, GitErro
     Ok(out)
 }
 
-/// Size of a blob if it's in the local object database.
+/// Size of a blob if it's in the local object database. A corrupt local
+/// copy is dropped and reported absent, so it gets refetched.
 pub fn blob_size(repo: &Repository, blob: Oid) -> Result<Option<u64>, GitError> {
-    match repo.odb()?.read_header(blob) {
-        Ok((size, ObjectType::Blob)) => Ok(Some(size as u64)),
-        Ok((_, other)) => Err(GitError::Command(format!(
-            "{blob} is a {other}, not a blob"
+    let dir = repo.path();
+    match loose::drop_if_corrupt(dir, blob, loose::read_header(dir, blob)) {
+        Ok((Kind::Blob, size)) => Ok(Some(size)),
+        Ok((other, _)) => Err(GitError::Command(format!(
+            "{blob} is a {}, not a blob",
+            other.name()
         ))),
-        Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(GitError::MissingObject(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -119,19 +114,10 @@ pub fn missing_objects(repo: &Repository, oids: &[Oid]) -> Result<Vec<Oid>, GitE
         .collect())
 }
 
+/// Contents of a small (at most 8 MiB) local blob, read with our bounded,
+/// hash-verifying loose reader rather than libgit2. A corrupt local copy is
+/// dropped and reported missing, so callers refetch it.
 pub fn read_blob(repo: &Repository, blob: Oid) -> Result<Vec<u8>, GitError> {
-    let blob_obj = repo.find_blob(blob).map_err(|e| missing(e, blob))?;
-    Ok(blob_obj.content().to_vec())
-}
-
-/// Number of pack files, used to decide when to repack.
-pub fn pack_count(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir.join("objects/pack"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
-                .count()
-        })
-        .unwrap_or(0)
+    let dir = repo.path();
+    loose::drop_if_corrupt(dir, blob, loose::read_small_blob(dir, blob, 8 << 20))
 }
