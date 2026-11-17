@@ -17,3 +17,7 @@ tap = "rgodha24/homebrew-tap"
 publish-jobs = ["homebrew", "./publish-crates"]
 # Run 'dist plan' on pull requests
 pr-run-mode = "plan"
+
+[dist.github-custom-runners]
+# GitHub dropped dist's default macos-14 arm64 runner.
+aarch64-apple-darwin = "macos-15"
