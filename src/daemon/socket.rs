@@ -109,23 +109,24 @@ async fn handle(ctx: &Context, request: Request) -> Result<Response, RpcError> {
         }
         Request::Gc => Ok(Response::Gc(super::maintenance::gc(&ctx.repos).await)),
         Request::List => {
-            let mut repos = Vec::new();
-            for key in ctx.repos.paths().cached_repos() {
-                let handle = ctx.repos.get(&key);
-                let dir = handle.dir().to_path_buf();
-                let commit = handle.cached_head_commit().map(|c| c.to_string());
-                let size = tokio::task::spawn_blocking(move || dir_size(&dir))
-                    .await
-                    .unwrap_or(0);
-                repos.push(RepoInfo {
+            // No sizes: summing them means a stat of every cached object
+            // (millions), whose inode cache counts against the daemon's
+            // memory limit.
+            let repos = ctx
+                .repos
+                .paths()
+                .cached_repos()
+                .into_iter()
+                .map(|key| RepoInfo {
+                    commit: ctx
+                        .repos
+                        .get(&key)
+                        .cached_head_commit()
+                        .map(|c| c.to_string()),
                     owner: key.owner.to_string(),
                     repo: key.repo.to_string(),
-                    commit,
-                    last_sync: None,
-                    last_access: None,
-                    total_size_bytes: size,
-                });
-            }
+                })
+                .collect();
             Ok(Response::List(ListResult { repos }))
         }
         Request::Version => Ok(Response::Version(VersionResult {
@@ -144,18 +145,4 @@ fn rpc_error(e: RepoError) -> RpcError {
         RepoError::NotFound(_) => RpcError::not_found(e.to_string()),
         RepoError::Failed(_) => RpcError::internal(e.to_string()),
     }
-}
-
-pub fn dir_size(dir: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.file_type() {
-            Ok(t) if t.is_dir() => dir_size(&e.path()),
-            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
-            Err(_) => 0,
-        })
-        .sum()
 }
