@@ -8,6 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use dashmap::DashMap;
+
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
@@ -19,14 +21,27 @@ use crate::vfs::{Attr, FileKind, Vfs};
 /// Keep file contents in the page cache across opens; blobs are immutable.
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
+/// One directory listing: `.`, `..`, then the entries.
+type Listing = Arc<Vec<(u64, FileType, Vec<u8>)>>;
+
 pub struct FuseFs {
     vfs: Arc<Vfs>,
     rt: Handle,
+    /// Listing per open directory handle. The kernel reads a directory in
+    /// pages of ~100 entries; building the listing once per `opendir` instead
+    /// of per page keeps big directories linear and the pages consistent.
+    listings: Arc<DashMap<u64, Listing>>,
+    next_fh: u64,
 }
 
 impl FuseFs {
     pub fn new(vfs: Arc<Vfs>, rt: Handle) -> Self {
-        Self { vfs, rt }
+        Self {
+            vfs,
+            rt,
+            listings: Arc::new(DashMap::new()),
+            next_fh: 1,
+        }
     }
 
     /// Mount in a background session; unmounts when the returned session drops.
@@ -85,7 +100,10 @@ impl Filesystem for FuseFs {
         self.rt.spawn(async move {
             let result = async {
                 let ino = vfs.lookup(parent, &name).await?;
-                vfs.getattr(ino).await
+                // Counted before anything else can await, so the inode can't
+                // be swept while its attributes are fetched.
+                vfs.retain(ino);
+                vfs.getattr(ino).await.inspect_err(|_| vfs.forget(ino, 1))
             }
             .await;
             match result {
@@ -98,6 +116,10 @@ impl Filesystem for FuseFs {
                 Err(e) => reply.error(e),
             }
         });
+    }
+
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        self.vfs.forget(ino, nlookup);
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -169,11 +191,21 @@ impl Filesystem for FuseFs {
         reply.ok();
     }
 
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        if !self.vfs.exists(ino) {
+            reply.error(libc::ENOENT);
+            return;
+        }
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        reply.opened(fh, 0);
+    }
+
     fn readdir(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
@@ -182,30 +214,50 @@ impl Filesystem for FuseFs {
             return;
         }
         let vfs = self.vfs.clone();
+        let listings = self.listings.clone();
         self.rt.spawn(async move {
-            let children = match vfs.readdir(ino).await {
-                Ok(children) => children,
-                Err(e) => {
-                    reply.error(e);
-                    return;
+            // Offset 0 starts a fresh pass (also after rewinddir).
+            let cached = (offset > 0)
+                .then(|| listings.get(&fh).map(|l| l.clone()))
+                .flatten();
+            let listing = match cached {
+                Some(listing) => listing,
+                None => {
+                    let children = match vfs.readdir(ino).await {
+                        Ok(children) => children,
+                        Err(e) => {
+                            reply.error(e);
+                            return;
+                        }
+                    };
+                    let mut listing = Vec::with_capacity(children.len() + 2);
+                    listing.push((ino, FileType::Directory, b".".to_vec()));
+                    listing.push((vfs.parent(ino).await, FileType::Directory, b"..".to_vec()));
+                    listing.extend(children.into_iter().map(|c| (c.ino, kind(c.kind), c.name)));
+                    let listing = Arc::new(listing);
+                    listings.insert(fh, listing.clone());
+                    listing
                 }
             };
-            let dots = [
-                (ino, FileType::Directory, b".".as_slice()),
-                (vfs.parent(ino), FileType::Directory, b"..".as_slice()),
-            ];
-            let entries = dots.into_iter().chain(
-                children
-                    .iter()
-                    .map(|c| (c.ino, kind(c.kind), c.name.as_slice())),
-            );
-            for (i, (child, file_type, name)) in entries.enumerate().skip(offset as usize) {
-                if reply.add(child, (i + 1) as i64, file_type, OsStr::from_bytes(name)) {
+            for (i, (child, file_type, name)) in listing.iter().enumerate().skip(offset as usize) {
+                if reply.add(*child, (i + 1) as i64, *file_type, OsStr::from_bytes(name)) {
                     break;
                 }
             }
             reply.ok();
         });
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        self.listings.remove(&fh);
+        reply.ok();
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {

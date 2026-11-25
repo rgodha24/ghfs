@@ -691,3 +691,84 @@ async fn corrupt_loose_blobs_are_dropped_and_refetched() {
         }
     }
 }
+
+#[tokio::test]
+async fn forgotten_inodes_are_swept_and_come_back() {
+    use std::time::Duration;
+    let remote = Remote::new();
+    sample(&remote);
+    let env = Env::new(remote);
+    let vfs = &env.vfs;
+
+    let file = env.walk("octo/hello/src/main.rs").await.unwrap();
+    let src = vfs.parent(file).await;
+    vfs.retain(src);
+    vfs.retain(file);
+    // Listed but never looked up: nothing holds these.
+    env.ls("octo/hello").await;
+    let before = vfs.len();
+
+    // Held inodes survive; unheld idle ones go.
+    let swept = vfs.sweep(Duration::ZERO);
+    assert!(swept > 0, "listed-only inodes are swept");
+    assert_eq!(vfs.len(), before - swept);
+    assert!(vfs.exists(file) && vfs.exists(src));
+    assert_eq!(vfs.read(file, 0, 100).await.unwrap().0, b"fn main() {}\n");
+
+    // Once the kernel forgets it, the same path gets a fresh inode that
+    // still works.
+    vfs.forget(file, 1);
+    vfs.sweep(Duration::ZERO);
+    assert!(!vfs.exists(file));
+    let again = vfs.lookup(src, b"main.rs").await.unwrap();
+    assert_ne!(again, file);
+    assert_eq!(vfs.read(again, 0, 100).await.unwrap().0, b"fn main() {}\n");
+
+    // Recently used inodes are kept even when unheld.
+    assert!(vfs.sweep(Duration::from_secs(3600)) == 0);
+    assert!(vfs.exists(again));
+}
+
+#[tokio::test]
+async fn identical_objects_at_different_paths_stay_distinct() {
+    use std::time::Duration;
+    let remote = Remote::new();
+    // `a/x` and `b/x` are the same tree; `f` and `g` the same blob.
+    remote.repo(
+        "octo",
+        "twins",
+        &[
+            ("a/x/f", b"same\n"),
+            ("a/x/g", b"same\n"),
+            ("a/marker", b"a\n"),
+            ("b/x/f", b"same\n"),
+            ("b/x/g", b"same\n"),
+            ("b/marker", b"b\n"),
+        ],
+    );
+    let env = Env::new(remote);
+    let vfs = &env.vfs;
+    let handle = |ino| vfs.handle(ino).unwrap();
+    let ax = handle(env.walk("octo/twins/a/x").await.unwrap());
+    let bx = handle(env.walk("octo/twins/b/x").await.unwrap());
+    let f = handle(env.walk("octo/twins/a/x/f").await.unwrap());
+    let g = handle(env.walk("octo/twins/a/x/g").await.unwrap());
+    assert_ne!(ax, bx);
+    assert_ne!(f, g);
+
+    // Rebuilt from their handles, each `x` finds its own parent again.
+    assert!(vfs.sweep(Duration::ZERO) > 0);
+    let ax = vfs.resolve(&ax).await.unwrap();
+    let bx = vfs.resolve(&bx).await.unwrap();
+    assert_ne!(ax, bx);
+    for (x, want) in [(ax, b"a\n"), (bx, b"b\n")] {
+        let up = vfs.parent(x).await;
+        let marker = vfs.lookup(up, b"marker").await.unwrap();
+        assert_eq!(vfs.read(marker, 0, 10).await.unwrap().0, want);
+        // Remembered, not searched for again.
+        assert_eq!(vfs.parent(x).await, up);
+    }
+    let f = vfs.resolve(&f).await.unwrap();
+    let g = vfs.resolve(&g).await.unwrap();
+    assert_ne!(f, g);
+}

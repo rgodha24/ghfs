@@ -7,14 +7,14 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use super::xdr::{Reader, Writer, XdrError, XdrResult, opaque_size};
-use crate::vfs::{Attr, FileKind, ROOT_INO, Vfs};
+use crate::vfs::{Attr, FileKind, ROOT_INO, Vfs, handle};
 
 const NFS_PROGRAM: u32 = 100003;
 const MOUNT_PROGRAM: u32 = 100005;
@@ -43,7 +43,6 @@ const MAX_RECORD: usize = 1 << 20;
 const MAX_INFLIGHT_PER_CONN: usize = 128;
 /// Largest READ we serve (advertised as rtmax).
 const MAX_READ: u32 = 1 << 20;
-const FH_LEN: usize = 16;
 const FSID: u64 = 0x6768_6673; // "ghfs"
 
 mod stat {
@@ -87,9 +86,6 @@ fn errno_to_stat(errno: i32) -> u32 {
 
 pub struct NfsServer {
     vfs: Arc<Vfs>,
-    /// Embedded in file handles so handles from a previous daemon run come
-    /// back as STALE instead of aliasing new inodes.
-    boot: u64,
     /// Only serve NFS requests whose AUTH_UNIX credential is this uid (or
     /// root). The kernel stamps every request with the calling user's uid, so
     /// other local users going through the mount are refused. (A process
@@ -97,7 +93,18 @@ pub struct NfsServer {
     /// don't help either, since macOS lets anyone bind ports below 1024 and
     /// its NFS client doesn't use them by default.)
     owner_uid: Option<u32>,
+    /// Listing per directory handle from its last READDIR at cookie 0. Later
+    /// pages (cookie > 0) reuse it instead of rebuilding the whole directory
+    /// for every ~100 entries, and see one consistent snapshot. Entries are
+    /// kept with their handles: an inode may be swept before the next page.
+    listings: Mutex<lru::LruCache<Vec<u8>, Arc<Listing>>>,
 }
+
+/// `(inode, handle, name)` per entry, starting with `.` and `..`.
+type Listing = Vec<(u64, Vec<u8>, Vec<u8>)>;
+
+/// Directories whose listing is kept for paging.
+const LISTINGS: usize = 64;
 
 impl NfsServer {
     /// A server that only answers the daemon's own user (and root).
@@ -116,14 +123,12 @@ impl NfsServer {
     }
 
     fn build(vfs: Arc<Vfs>, owner_uid: Option<u32>) -> Arc<Self> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
         Arc::new(Self {
             vfs,
-            boot: nanos ^ ((std::process::id() as u64) << 32),
             owner_uid,
+            listings: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(LISTINGS).unwrap(),
+            )),
         })
     }
 
@@ -275,24 +280,26 @@ impl NfsServer {
         })
     }
 
-    fn fh(&self, ino: u64) -> [u8; FH_LEN] {
-        let mut out = [0u8; FH_LEN];
-        out[..8].copy_from_slice(&self.boot.to_be_bytes());
-        out[8..].copy_from_slice(&ino.to_be_bytes());
-        out
+    /// File handle for `ino`. Handles describe the node itself (see
+    /// [`crate::vfs::handle`]), so the inode may be swept and still come back.
+    fn fh(&self, ino: u64) -> Option<Vec<u8>> {
+        self.vfs.handle(ino)
     }
 
-    fn read_fh(&self, r: &mut Reader<'_>) -> XdrResult<Result<u64, u32>> {
-        let raw = r.opaque(64)?;
-        if raw.len() != FH_LEN {
-            return Ok(Err(stat::BADHANDLE));
-        }
-        let boot = u64::from_be_bytes(raw[..8].try_into().unwrap());
-        let ino = u64::from_be_bytes(raw[8..].try_into().unwrap());
-        if boot != self.boot || !self.vfs.exists(ino) {
-            return Ok(Err(stat::STALE));
-        }
-        Ok(Ok(ino))
+    /// NFS fileid: derived from the handle, so it stays the same when the
+    /// inode behind it is rebuilt.
+    fn fileid(&self, ino: u64) -> u64 {
+        self.fh(ino).map_or(ino, |fh| handle::fileid(&fh))
+    }
+
+    async fn read_fh(&self, r: &mut Reader<'_>) -> XdrResult<Result<u64, u32>> {
+        let raw = r.opaque(handle::MAX_LEN)?.to_vec();
+        Ok(self.vfs.resolve(&raw).await.map_err(|e| match e {
+            libc::EBADF => stat::BADHANDLE,
+            libc::ESTALE => stat::STALE,
+            // Transient (fetch or disk) failure: retrying may work.
+            _ => stat::IO,
+        }))
     }
 
     fn mount3(&self, xid: u32, proc_: u32, r: &mut Reader<'_>) -> XdrResult<Writer> {
@@ -304,7 +311,7 @@ impl NfsServer {
                 log::info!("nfs: mount request for {:?}", String::from_utf8_lossy(path));
                 let mut w = accepted(xid, SUCCESS);
                 w.u32(0)
-                    .opaque(&self.fh(ROOT_INO))
+                    .opaque(&self.fh(ROOT_INO).expect("root has a handle"))
                     .u32(2)
                     .u32(AUTH_UNIX)
                     .u32(AUTH_NONE);
@@ -339,9 +346,9 @@ impl NfsServer {
             6 => self.read(r, &mut w).await?,
             16 => self.readdir(r, &mut w, false).await?,
             17 => self.readdir(r, &mut w, true).await?,
-            18 => self.fsstat(r, &mut w)?,
-            19 => self.fsinfo(r, &mut w)?,
-            20 => self.pathconf(r, &mut w)?,
+            18 => self.fsstat(r, &mut w).await?,
+            19 => self.fsinfo(r, &mut w).await?,
+            20 => self.pathconf(r, &mut w).await?,
             // SETATTR, WRITE, CREATE, MKDIR, SYMLINK, MKNOD, REMOVE, RMDIR, COMMIT:
             // ROFS with empty wcc_data.
             2 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 21 => {
@@ -365,7 +372,7 @@ impl NfsServer {
     }
 
     async fn getattr(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        let ino = match self.read_fh(r)? {
+        let ino = match self.read_fh(r).await? {
             Ok(ino) => ino,
             Err(status) => {
                 w.u32(status);
@@ -375,7 +382,7 @@ impl NfsServer {
         match self.vfs.getattr(ino).await {
             Ok(attr) => {
                 w.u32(stat::OK);
-                write_fattr(w, &attr);
+                write_fattr(w, &self.nfs_attr(attr));
             }
             Err(e) => {
                 w.u32(errno_to_stat(e));
@@ -385,11 +392,17 @@ impl NfsServer {
     }
 
     async fn local_attr(&self, ino: u64) -> Option<Attr> {
-        self.vfs.getattr_local(ino).await.ok().flatten()
+        let attr = self.vfs.getattr_local(ino).await.ok().flatten()?;
+        Some(self.nfs_attr(attr))
+    }
+
+    fn nfs_attr(&self, mut attr: Attr) -> Attr {
+        attr.ino = self.fileid(attr.ino);
+        attr
     }
 
     async fn lookup(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        let dir = self.read_fh(r)?;
+        let dir = self.read_fh(r).await?;
         let name = r.opaque(1024)?;
         let dir = match dir {
             Ok(dir) => dir,
@@ -405,9 +418,13 @@ impl NfsServer {
         }
         match self.vfs.lookup(dir, name).await {
             Ok(ino) => {
+                let Some(fh) = self.fh(ino) else {
+                    w.u32(stat::IO).bool(false);
+                    return Ok(());
+                };
                 let obj = self.local_attr(ino).await;
                 let dir_attr = self.local_attr(dir).await;
-                w.u32(stat::OK).opaque(&self.fh(ino));
+                w.u32(stat::OK).opaque(&fh);
                 post_op_attr(w, obj.as_ref());
                 post_op_attr(w, dir_attr.as_ref());
             }
@@ -421,7 +438,7 @@ impl NfsServer {
     }
 
     async fn access(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        let ino = self.read_fh(r)?;
+        let ino = self.read_fh(r).await?;
         let wanted = r.u32()?;
         match ino {
             Ok(ino) => {
@@ -445,7 +462,7 @@ impl NfsServer {
     }
 
     async fn readlink(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        let ino = match self.read_fh(r)? {
+        let ino = match self.read_fh(r).await? {
             Ok(ino) => ino,
             Err(status) => {
                 w.u32(status).bool(false);
@@ -467,7 +484,7 @@ impl NfsServer {
     }
 
     async fn read(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        let ino = self.read_fh(r)?;
+        let ino = self.read_fh(r).await?;
         let offset = r.u64()?;
         let count = r.u32()?.min(MAX_READ);
         let ino = match ino {
@@ -492,7 +509,7 @@ impl NfsServer {
     }
 
     async fn readdir(&self, r: &mut Reader<'_>, w: &mut Writer, plus: bool) -> XdrResult<()> {
-        let dir = self.read_fh(r)?;
+        let dir = self.read_fh(r).await?;
         let cookie = r.u64()?;
         let _verf = r.fixed(8)?;
         let (dircount, maxcount) = if plus {
@@ -508,19 +525,45 @@ impl NfsServer {
                 return Ok(());
             }
         };
-        let children = match self.vfs.readdir(dir).await {
-            Ok(children) => children,
-            Err(e) => {
-                let attr = self.local_attr(dir).await;
-                w.u32(errno_to_stat(e));
-                post_op_attr(w, attr.as_ref());
-                return Ok(());
-            }
+        let Some(dir_fh) = self.fh(dir) else {
+            w.u32(stat::IO).bool(false);
+            return Ok(());
         };
-        let mut entries: Vec<(u64, &[u8])> = Vec::with_capacity(children.len() + 2);
-        entries.push((dir, b"."));
-        entries.push((self.vfs.parent(dir), b".."));
-        entries.extend(children.iter().map(|c| (c.ino, c.name.as_slice())));
+        let cached = (cookie > 0)
+            .then(|| {
+                self.listings
+                    .lock()
+                    .expect("listings poisoned")
+                    .get(&dir_fh)
+                    .cloned()
+            })
+            .flatten();
+        let entries = match cached {
+            Some(entries) => entries,
+            None => match self.vfs.readdir(dir).await {
+                Ok(children) => {
+                    let parent = self.vfs.parent(dir).await;
+                    let dots = [(dir, b".".to_vec()), (parent, b"..".to_vec())];
+                    let entries: Listing = dots
+                        .into_iter()
+                        .chain(children.into_iter().map(|c| (c.ino, c.name)))
+                        .filter_map(|(ino, name)| Some((ino, self.fh(ino)?, name)))
+                        .collect();
+                    let entries = Arc::new(entries);
+                    self.listings
+                        .lock()
+                        .expect("listings poisoned")
+                        .put(dir_fh, entries.clone());
+                    entries
+                }
+                Err(e) => {
+                    let attr = self.local_attr(dir).await;
+                    w.u32(errno_to_stat(e));
+                    post_op_attr(w, attr.as_ref());
+                    return Ok(());
+                }
+            },
+        };
 
         let start = cookie as usize;
         if start > entries.len() {
@@ -539,14 +582,26 @@ impl NfsServer {
         let mut size = body.len() + 8;
         let mut dir_size = 0usize;
         let mut emitted = 0usize;
-        for (i, (ino, name)) in entries.iter().enumerate().skip(start) {
+        for (i, (ino, fh, name)) in entries.iter().enumerate().skip(start) {
             let base = 4 + 8 + opaque_size(name.len()) + 8;
             let mut entry = Writer::new();
-            entry.bool(true).u64(*ino).opaque(name).u64(i as u64 + 1);
+            entry
+                .bool(true)
+                .u64(handle::fileid(fh))
+                .opaque(name)
+                .u64(i as u64 + 1);
             if plus {
-                let attr = self.local_attr(*ino).await;
+                let ino = if self.vfs.exists(*ino) {
+                    Ok(*ino)
+                } else {
+                    self.vfs.resolve(fh).await
+                };
+                let attr = match ino {
+                    Ok(ino) => self.local_attr(ino).await,
+                    Err(_) => None,
+                };
                 post_op_attr(&mut entry, attr.as_ref());
-                entry.bool(true).opaque(&self.fh(*ino));
+                entry.bool(true).opaque(fh);
             }
             if size + entry.len() > maxcount || dir_size + base > dircount {
                 break;
@@ -567,8 +622,8 @@ impl NfsServer {
         Ok(())
     }
 
-    fn fsstat(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        match self.read_fh(r)? {
+    async fn fsstat(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
+        match self.read_fh(r).await? {
             Ok(_) => {
                 w.u32(stat::OK).bool(false);
                 w.u64(0).u64(0).u64(0).u64(0).u64(0).u64(0).u32(0);
@@ -580,8 +635,8 @@ impl NfsServer {
         Ok(())
     }
 
-    fn fsinfo(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        match self.read_fh(r)? {
+    async fn fsinfo(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
+        match self.read_fh(r).await? {
             Ok(_) => {
                 w.u32(stat::OK).bool(false);
                 w.u32(MAX_READ) // rtmax
@@ -603,8 +658,8 @@ impl NfsServer {
         Ok(())
     }
 
-    fn pathconf(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
-        match self.read_fh(r)? {
+    async fn pathconf(&self, r: &mut Reader<'_>, w: &mut Writer) -> XdrResult<()> {
+        match self.read_fh(r).await? {
             Ok(_) => {
                 w.u32(stat::OK).bool(false);
                 w.u32(1) // linkmax
