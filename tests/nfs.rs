@@ -321,8 +321,10 @@ async fn protocol_basics() {
     assert_eq!(c.lookup(&hello, "nope").await, Err(NOENT));
     assert_eq!(c.lookup(&readme, "x").await, Err(NOTDIR));
     assert_eq!(c.lookup(&root, "._octo").await, Err(NOENT));
+    // A well-formed handle for an object that isn't there (here: a blob
+    // oid its directory doesn't contain) is stale; garbage is a bad handle.
     let mut stale = readme.clone();
-    stale[0] ^= 0xff;
+    stale[25] ^= 0xff;
     assert_eq!(c.getattr(&stale).await, Err(STALE));
     assert_eq!(c.getattr(&[1, 2, 3]).await, Err(BADHANDLE));
 
@@ -490,4 +492,86 @@ async fn refuses_other_users() {
     let mut c = Client::connect(port).await;
     let root = c.mount().await;
     assert_eq!(c.getattr(&root).await.unwrap().0, 2);
+}
+
+/// NFS has no `forget`, so handles describe their node: the inode table can
+/// be swept empty and every handle the client holds still works, keeps its
+/// fileid, and finds its way back up with `..`. Handles even survive a new
+/// daemon over the same cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handles_outlive_their_inodes() {
+    let remote = Remote::new();
+    sample(&remote);
+    let env = Env::new(remote);
+    let port = start(&env).await;
+    let mut c = Client::connect(port).await;
+    let root = c.mount().await;
+
+    let src = c.walk(&root, "octo/hello/src").await;
+    let main = c.walk(&root, "octo/hello/src/main.rs").await;
+    let many = c.walk(&root, "octo/hello/many").await;
+    let (_, _, main_id) = c.getattr(&main).await.unwrap();
+    let (_, _, src_id) = c.getattr(&src).await.unwrap();
+    let hello = c.walk(&root, "octo/hello").await;
+    let (_, _, hello_id) = c.getattr(&hello).await.unwrap();
+    let listed = c.list(&many, true, 1024).await;
+
+    let before = env.vfs.len();
+    assert!(env.vfs.sweep(Duration::ZERO) > 0);
+    assert!(env.vfs.len() < before);
+    assert_eq!(env.vfs.len(), 2, "only / and by-ref are left");
+
+    // Same handles, rebuilt inodes, same fileids.
+    assert_eq!(c.getattr(&main).await.unwrap().2, main_id);
+    assert_eq!(
+        c.read(&main, 0, 100).await,
+        (b"fn main() {}\n".to_vec(), true)
+    );
+    assert_eq!(c.lookup(&src, "lib.rs").await, Err(NOENT));
+    assert_eq!(c.lookup(&src, "main.rs").await.unwrap(), main);
+
+    // `..` of a rebuilt directory searches its commit for the parent.
+    env.vfs.sweep(Duration::ZERO);
+    let up = c.lookup(&src, "..").await.unwrap();
+    assert_eq!(up, hello, "src/.. is the HEAD repo dir again");
+    assert_eq!(c.getattr(&up).await.unwrap().2, hello_id);
+    assert_eq!(c.getattr(&src).await.unwrap().2, src_id);
+
+    // A listing's later pages survive a sweep between pages.
+    env.vfs.sweep(Duration::ZERO);
+    assert_eq!(c.list(&many, true, 1024).await, listed);
+
+    // New daemon (same cache): the old handles still resolve.
+    let repos = ghfs::repos::Repos::new(
+        ghfs::paths::CachePaths::new(env.cache.path()),
+        env.remote.cli(),
+    );
+    let vfs = ghfs::vfs::Vfs::new(repos);
+    let (listener, port) = ghfs::nfs::bind().await.unwrap();
+    tokio::spawn(NfsServer::new_unrestricted(vfs).serve(listener));
+    let mut c = Client::connect(port).await;
+    assert_eq!(
+        c.read(&main, 0, 100).await,
+        (b"fn main() {}\n".to_vec(), true)
+    );
+    assert_eq!(c.getattr(&main).await.unwrap().2, main_id);
+    assert_eq!(c.lookup(&src, "..").await.unwrap(), hello);
+}
+
+/// Inside `by-ref`, `..` of a rebuilt top-level directory is the commit, not
+/// the moving HEAD view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn by_ref_parent_after_sweep() {
+    let remote = Remote::new();
+    sample(&remote);
+    let env = Env::new(remote);
+    let port = start(&env).await;
+    let mut c = Client::connect(port).await;
+    let root = c.mount().await;
+    let commit = c.walk(&root, "by-ref/octo/hello/main").await;
+    let src = c.walk(&root, "by-ref/octo/hello/main/src").await;
+    env.vfs.sweep(Duration::ZERO);
+    let up = c.lookup(&src, "..").await.unwrap();
+    assert_eq!(up, commit);
+    assert_ne!(up, c.walk(&root, "octo/hello").await);
 }

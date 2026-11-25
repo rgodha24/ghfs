@@ -43,6 +43,27 @@ const MAX_REPO_HANDLES: usize = 8;
 /// Background directory prefetches running at once. Requests that actually
 /// wait on a directory don't take a slot, so they never queue behind these.
 const MAX_PREFETCHES: usize = 8;
+/// Parsed trees kept in memory (shared by all repos; trees are
+/// content-addressed). Every lookup in a directory needs its tree.
+const TREE_CACHE: usize = 1024;
+/// Per-repo memory of which blob files were size-checked this run and which
+/// subtrees were already prefetched. Forgetting an entry only costs a stat
+/// or a redundant local tree walk.
+const VERIFIED_CACHE: usize = 1 << 16;
+const PREFETCHED_CACHE: usize = 1 << 14;
+/// Missing-repo entries kept before expired ones are pruned.
+const MAX_NOT_FOUND: usize = 1024;
+
+/// Add `oid` to a set capped at `cap` (allocated as it grows, since most
+/// repos never get near it). Whether it was already there.
+fn remember(set: &Mutex<LruCache<Oid, ()>>, oid: Oid, cap: usize) -> bool {
+    let mut set = set.lock().expect("set poisoned");
+    let had = set.put(oid, ()).is_some();
+    if set.len() > cap {
+        set.pop_lru();
+    }
+    had
+}
 
 const HEAD_META_FILE: &str = "ghfs-head";
 
@@ -94,6 +115,9 @@ pub struct Repos {
     /// Directory prefetches spawned and not yet finished.
     prefetches: Arc<std::sync::atomic::AtomicUsize>,
     head_ttl_ms: AtomicU64,
+    trees: Mutex<LruCache<Oid, Arc<[TreeEntry]>>>,
+    /// Repo ids (as used in file handles) seen this run.
+    ids: DashMap<u64, RepoKey>,
 }
 
 impl Repos {
@@ -109,6 +133,8 @@ impl Repos {
             prefetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PREFETCHES)),
             prefetches: Arc::default(),
             head_ttl_ms: AtomicU64::new(DEFAULT_HEAD_TTL.as_millis() as u64),
+            trees: Mutex::new(LruCache::new(NonZeroUsize::new(TREE_CACHE).unwrap())),
+            ids: DashMap::new(),
         })
     }
 
@@ -130,11 +156,28 @@ impl Repos {
         &self.paths
     }
 
+    /// The repo a file-handle repo id stands for: one used this run, or
+    /// (after a restart) one in the cache.
+    pub fn by_id(&self, id: u64) -> Option<RepoKey> {
+        if let Some(key) = self.ids.get(&id) {
+            return Some(key.clone());
+        }
+        let key = self
+            .paths
+            .cached_repos()
+            .into_iter()
+            .find(|key| crate::vfs::handle::repo_id(key) == id)?;
+        self.ids.insert(id, key.normalized());
+        Some(key)
+    }
+
     pub fn get(self: &Arc<Self>, key: &RepoKey) -> Arc<RepoHandle> {
         let key = &key.normalized();
         if let Some(handle) = self.repos.get(key) {
             return handle.clone();
         }
+        self.ids
+            .insert(crate::vfs::handle::repo_id(key), key.clone());
         self.repos
             .entry(key.clone())
             .or_insert_with(|| {
@@ -155,10 +198,10 @@ impl Repos {
                     blob_flight: SingleFlight::default(),
                     bulk_flight: SingleFlight::default(),
                     materialize_flight: SingleFlight::default(),
-                    verified: Mutex::new(std::collections::HashSet::new()),
+                    verified: Mutex::new(LruCache::unbounded()),
                     validated_commits: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
                     read_slots: self.read_slots.clone(),
-                    prefetched: Mutex::new(std::collections::HashSet::new()),
+                    prefetched: Mutex::new(LruCache::unbounded()),
                     changed_at: Mutex::new(self.started),
                 })
             })
@@ -184,7 +227,19 @@ impl Repos {
     }
 
     fn mark_missing(&self, key: &RepoKey) {
+        // Names that don't exist (typos, probes) would otherwise pile up.
+        if self.not_found.len() >= MAX_NOT_FOUND {
+            self.not_found.retain(|_, at| at.elapsed() < NOT_FOUND_TTL);
+        }
         self.not_found.insert(key.clone(), Instant::now());
+    }
+
+    /// Drop the handle for a repo that turned out not to exist.
+    fn discard(&self, key: &RepoKey) {
+        let key = key.normalized();
+        self.repos.remove(&key);
+        self.ids
+            .remove_if(&crate::vfs::handle::repo_id(&key), |_, k| *k == key);
     }
 
     pub fn started(&self) -> SystemTime {
@@ -247,13 +302,13 @@ pub struct RepoHandle {
     /// Writing a blob's contents to the on-disk cache, keyed by blob oid.
     materialize_flight: SingleFlight<Oid, Result<PathBuf>>,
     /// Cached blob files whose length was checked against the object this run.
-    verified: Mutex<std::collections::HashSet<Oid>>,
+    verified: Mutex<LruCache<Oid, ()>>,
     /// A marker's complete tree closure is validated once per run, with a bounded cache.
     validated_commits: Mutex<LruCache<Oid, (Oid, i64)>>,
     read_slots: Arc<tokio::sync::Semaphore>,
     /// Trees whose subtree prefetch is scheduled or done (FUSE and NFS list
     /// a directory in pages; only the first page should start one).
-    prefetched: Mutex<std::collections::HashSet<Oid>>,
+    prefetched: Mutex<LruCache<Oid, ()>>,
     /// When HEAD or the ref listing last changed. Used as the directory mtime
     /// of `<owner>/<repo>` and `by-ref/<owner>/<repo>` so kernels revalidate
     /// cached names after a branch moves.
@@ -412,16 +467,23 @@ impl RepoHandle {
                 let refs = match this.git.ls_remote_head(&this.url).await {
                     Ok(refs) => refs,
                     Err(e) => {
+                        // Keep serving the cached HEAD and wait a full TTL
+                        // before retrying, so being offline doesn't turn every
+                        // lookup into a failing remote request.
+                        let known = match this.head.lock().expect("head poisoned").as_mut() {
+                            Some(cached) => {
+                                cached.at = Instant::now();
+                                true
+                            }
+                            None => false,
+                        };
                         if matches!(e, GitError::RepoNotFound(_))
                             && let Some(repos) = this.repos.upgrade()
                         {
                             repos.mark_missing(&this.key);
-                        }
-                        // Keep serving the cached HEAD and wait a full TTL
-                        // before retrying, so being offline doesn't turn every
-                        // lookup into a failing remote request.
-                        if let Some(cached) = this.head.lock().expect("head poisoned").as_mut() {
-                            cached.at = Instant::now();
+                            if !known {
+                                repos.discard(&this.key);
+                            }
                         }
                         return Err(e.into());
                     }
@@ -585,8 +647,27 @@ impl RepoHandle {
             .await
     }
 
-    pub async fn tree(self: &Arc<Self>, tree: Oid) -> Result<Vec<TreeEntry>> {
-        self.with_repo(move |r| odb::read_tree(r, tree)).await
+    /// A directory's entries, parsed once and then served from memory.
+    pub async fn tree(self: &Arc<Self>, tree: Oid) -> Result<Arc<[TreeEntry]>> {
+        let repos = self.repos.upgrade();
+        if let Some(hit) = repos
+            .as_ref()
+            .and_then(|r| r.trees.lock().expect("trees poisoned").get(&tree).cloned())
+        {
+            return Ok(hit);
+        }
+        let entries: Arc<[TreeEntry]> = self
+            .with_repo(move |r| odb::read_tree(r, tree))
+            .await?
+            .into();
+        if let Some(repos) = repos {
+            repos
+                .trees
+                .lock()
+                .expect("trees poisoned")
+                .put(tree, entries.clone());
+        }
+        Ok(entries)
     }
 
     /// Size of a blob, fetching it (with the rest of `dir_tree`) if needed.
@@ -638,10 +719,7 @@ impl RepoHandle {
                 // by an earlier run wasn't truncated by a crash.
                 if let Ok(meta) = tokio::fs::metadata(&path).await {
                     if meta.len() == size {
-                        this.verified
-                            .lock()
-                            .expect("verified poisoned")
-                            .insert(blob);
+                        remember(&this.verified, blob, VERIFIED_CACHE);
                         return Ok(path);
                     }
                     log::warn!(
@@ -722,10 +800,7 @@ impl RepoHandle {
                         tokio::fs::rename(&tmp, &path)
                             .await
                             .map_err(|e| RepoError::Failed(format!("rename blob: {e}")))?;
-                        this.verified
-                            .lock()
-                            .expect("verified poisoned")
-                            .insert(blob);
+                        remember(&this.verified, blob, VERIFIED_CACHE);
                         Ok(path)
                     }
                     Ok(written) => {
@@ -838,12 +913,7 @@ impl RepoHandle {
     /// GETATTR-per-entry) then finds the next levels already local instead of
     /// paying one round trip per directory.
     pub fn prefetch_dir(self: &Arc<Self>, tree: Oid) {
-        if !self
-            .prefetched
-            .lock()
-            .expect("prefetched poisoned")
-            .insert(tree)
-        {
+        if remember(&self.prefetched, tree, PREFETCHED_CACHE) {
             return;
         }
         let Some(repos) = self.repos.upgrade() else {
@@ -870,7 +940,7 @@ impl RepoHandle {
                 this.prefetched
                     .lock()
                     .expect("prefetched poisoned")
-                    .remove(&tree);
+                    .pop(&tree);
             }
         });
     }

@@ -56,7 +56,19 @@ pub fn start() -> Result<(), DaemonError> {
         return Err(DaemonError::AlreadyRunning);
     }
     raise_fd_limit();
+    limit_malloc_arenas();
+    // Trees are cached (parsed) in `Repos`; libgit2's own object cache, per
+    // pooled handle, would only hold second copies.
+    git2::opts::enable_caching(false);
+    // `available_parallelism` follows the cgroup CPU quota, so a service
+    // capped at one CPU would get a single worker, and any request stuck on
+    // CPU or page faults would stall every other one.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(MIN_WORKERS);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .thread_name("ghfs")
         .build()?;
@@ -67,6 +79,18 @@ pub fn start() -> Result<(), DaemonError> {
     // Remote workers have already been cancelled and joined before runtime exit.
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
+}
+
+const MIN_WORKERS: usize = 4;
+
+/// glibc gives every thread that allocates its own 64 MiB arena and rarely
+/// returns their memory; with hundreds of short-lived blocking-pool threads
+/// decoding packs, that alone grew to gigabytes.
+fn limit_malloc_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
 }
 
 /// A file server holds many loose objects, cached blobs and client
@@ -229,6 +253,7 @@ async fn mount_and_wait(
     mount_point: &Path,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), DaemonError> {
+    let sweeper = tokio::spawn(sweep_inodes(vfs.clone(), Duration::from_secs(60)));
     let fs = crate::fuse::FuseFs::new(vfs, tokio::runtime::Handle::current());
     let session = fs.mount(mount_point).map_err(DaemonError::Mount)?;
     log::info!("Mounted FUSE filesystem at {}", mount_point.display());
@@ -243,11 +268,32 @@ async fn mount_and_wait(
             }
         }
     }
+    sweeper.abort();
     // Dropping the session unmounts and joins the FUSE thread.
     tokio::task::spawn_blocking(move || drop(session))
         .await
         .map_err(|e| DaemonError::Io(std::io::Error::other(e)))?;
     Ok(())
+}
+
+/// Drop unused inodes so the inode table tracks what's in use instead of
+/// every path ever visited. FUSE: inodes the kernel has forgotten. NFS:
+/// anything idle (its handles rebuild inodes on demand).
+async fn sweep_inodes(vfs: Arc<Vfs>, idle: Duration) {
+    const EVERY: Duration = Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(EVERY).await;
+        let vfs = vfs.clone();
+        if let Ok((removed, left)) = tokio::task::spawn_blocking(move || {
+            let removed = vfs.sweep(idle);
+            (removed, vfs.len())
+        })
+        .await
+            && removed > 0
+        {
+            log::debug!("swept {removed} inodes, {left} left");
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -257,10 +303,14 @@ async fn mount_and_wait(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), DaemonError> {
     let (listener, port) = crate::nfs::bind().await?;
+    // Longer than FUSE: rebuilding a directory's `..` from a handle searches
+    // its commit, so don't make the client do that for every short pause.
+    let sweeper = tokio::spawn(sweep_inodes(vfs.clone(), Duration::from_secs(300)));
     let server = tokio::spawn(crate::nfs::NfsServer::new(vfs).serve(listener));
     let mount_point = tokio::fs::canonicalize(mount_point).await?;
     if let Err(e) = crate::nfs::mount(port, &mount_point).await {
         server.abort();
+        sweeper.abort();
         return Err(DaemonError::Mount(e));
     }
     log::info!(
@@ -278,6 +328,7 @@ async fn mount_and_wait(
                 if !mounted {
                     log::info!("Filesystem was unmounted externally");
                     server.abort();
+                    sweeper.abort();
                     return Ok(());
                 }
             }
@@ -288,6 +339,7 @@ async fn mount_and_wait(
         log::warn!("unmount failed: {e}");
     }
     server.abort();
+    sweeper.abort();
     Ok(())
 }
 
