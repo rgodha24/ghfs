@@ -55,10 +55,6 @@ pub struct RepoInfo {
     pub owner: String,
     pub repo: String,
     pub commit: Option<String>,
-    pub last_sync: Option<String>,   // Human-readable timestamp
-    pub last_access: Option<String>, // Human-readable timestamp
-    #[serde(default)]
-    pub total_size_bytes: u64,
 }
 
 /// List response
